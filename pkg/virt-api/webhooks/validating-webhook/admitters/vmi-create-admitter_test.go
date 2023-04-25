@@ -3580,6 +3580,122 @@ var _ = Describe("Validating VMICreate Admitter", func() {
 			Expect(causes[0].Message).To(ContainSubstring("fake must have max one memory dump volume set"))
 		})
 
+		DescribeTable("path validation should fail", func(path string) {
+			Expect(validatePath(k8sfield.NewPath("fake"), path)).To(HaveLen(1))
+		},
+			Entry("if path is not absolute", "a/b/c"),
+			Entry("if path contains relative elements", "/a/b/c/../d"),
+			Entry("if path is root", "/"),
+		)
+
+		DescribeTable("should count volume sources correctly", func(volumes []v1.Volume, expectErr bool) {
+			vmi := api.NewMinimalVMI("testvmi")
+
+			vmi.Spec.Volumes = volumes
+			causes := validateVolumes(k8sfield.NewPath("fake"), vmi.Spec.Volumes, config)
+			if expectErr {
+				Expect(causes).To(HaveLen(1))
+				Expect(causes[0].Message).To(ContainSubstring("must have exactly one source type set"))
+			} else {
+				Expect(causes).To(BeEmpty())
+			}
+		},
+			// Only test the sources which are not covered in other tests
+			Entry(
+				"valid pvc",
+				[]v1.Volume{
+					{
+						Name: "volume",
+						VolumeSource: v1.VolumeSource{
+							PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{},
+						},
+					},
+				},
+				false,
+			),
+			Entry(
+				"valid Sysprep",
+				[]v1.Volume{
+					{
+						Name: "volume",
+						VolumeSource: v1.VolumeSource{
+							Sysprep: &v1.SysprepSource{},
+						},
+					},
+				},
+				false,
+			),
+			Entry(
+				"valid ContainerDisk",
+				[]v1.Volume{
+					{
+						Name: "volume",
+						VolumeSource: v1.VolumeSource{
+							ContainerDisk: &v1.ContainerDiskSource{},
+						},
+					},
+				},
+				false,
+			),
+			Entry(
+				"valid Ephemeral",
+				[]v1.Volume{
+					{
+						Name: "volume",
+						VolumeSource: v1.VolumeSource{
+							Ephemeral: &v1.EphemeralVolumeSource{},
+						},
+					},
+				},
+				false,
+			),
+			Entry(
+				"valid EmptyDisk",
+				[]v1.Volume{
+					{
+						Name: "volume",
+						VolumeSource: v1.VolumeSource{
+							EmptyDisk: &v1.EmptyDiskSource{},
+						},
+					},
+				},
+				false,
+			),
+			Entry(
+				"valid MemoryDump",
+				[]v1.Volume{
+					{
+						Name: "volume",
+						VolumeSource: v1.VolumeSource{
+							MemoryDump: &v1.MemoryDumpVolumeSource{},
+						},
+					},
+				},
+				false,
+			),
+			Entry(
+				"valid EjectedCDRom",
+				[]v1.Volume{
+					{
+						Name: "volume",
+						VolumeSource: v1.VolumeSource{
+							EjectedCDRom: &v1.EjectedCDRomSource{},
+						},
+					},
+				},
+				false,
+			),
+			Entry(
+				"invalid source",
+				[]v1.Volume{
+					{
+						Name:         "volume",
+						VolumeSource: v1.VolumeSource{},
+					},
+				},
+				true,
+			),
+		)
 	})
 
 	Context("with bootloader", func() {

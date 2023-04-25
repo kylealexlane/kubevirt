@@ -333,9 +333,12 @@ var _ = Describe("VirtualMachine", func() {
 			testutils.ExpectEvent(recorder, SuccessfulDataVolumeCreateReason)
 		})
 
-		DescribeTable("should hotplug a vm", func(isRunning bool) {
+		DescribeTable("should hotplug a vm", func(isRunning bool, isInsertCDRom bool) {
 
 			vm, vmi := DefaultVirtualMachine(isRunning)
+			if isInsertCDRom {
+				vm, vmi = DefaultVirtualMachineWithCDRom(isRunning, true)
+			}
 			vm.Status.Created = true
 			vm.Status.Ready = true
 			vm.Status.VolumeRequests = []virtv1.VirtualMachineVolumeRequest{
@@ -347,7 +350,9 @@ var _ = Describe("VirtualMachine", func() {
 					},
 				},
 			}
-
+			if isInsertCDRom {
+				vm.Status.VolumeRequests[0].AddVolumeOptions.Disk = nil
+			}
 			addVirtualMachine(vm)
 
 			if isRunning {
@@ -368,11 +373,13 @@ var _ = Describe("VirtualMachine", func() {
 			controller.Execute()
 		},
 
-			Entry("that is running", true),
-			Entry("that is not running", false),
+			Entry("that is running", true, false),
+			Entry("that is not running", false, false),
+			Entry("that is running using insertcdrom", true, true),
+			Entry("that is not running using insertcdrom", false, true),
 		)
 
-		DescribeTable("should unhotplug a vm", func(isRunning bool) {
+		DescribeTable("should unhotplug a vm", func(isRunning bool, isEjectCDRom bool) {
 			vm, vmi := DefaultVirtualMachine(isRunning)
 			vm.Status.Created = true
 			vm.Status.Ready = true
@@ -383,9 +390,19 @@ var _ = Describe("VirtualMachine", func() {
 					},
 				},
 			}
-			vm.Spec.Template.Spec.Domain.Devices.Disks = append(vmi.Spec.Domain.Devices.Disks, virtv1.Disk{
-				Name: "vol1",
-			})
+
+			if isEjectCDRom {
+				vm.Spec.Template.Spec.Domain.Devices.Disks = append(vmi.Spec.Domain.Devices.Disks, virtv1.Disk{
+					Name: "vol1",
+					DiskDevice: virtv1.DiskDevice{
+						CDRom: &virtv1.CDRomTarget{},
+					},
+				})
+			} else {
+				vm.Spec.Template.Spec.Domain.Devices.Disks = append(vmi.Spec.Domain.Devices.Disks, virtv1.Disk{
+					Name: "vol1",
+				})
+			}
 			vm.Spec.Template.Spec.Volumes = append(vmi.Spec.Volumes, virtv1.Volume{
 				Name: "vol1",
 				VolumeSource: virtv1.VolumeSource{
@@ -405,9 +422,16 @@ var _ = Describe("VirtualMachine", func() {
 				vmiInterface.EXPECT().RemoveVolume(context.Background(), vmi.ObjectMeta.Name, vm.Status.VolumeRequests[0].RemoveVolumeOptions)
 			}
 
-			vmInterface.EXPECT().Update(context.Background(), gomock.Any()).Do(func(ctx context.Context, arg interface{}) {
-				Expect(arg.(*virtv1.VirtualMachine).Spec.Template.Spec.Volumes).To(BeEmpty())
-			}).Return(vm, nil)
+			if isEjectCDRom {
+				vmInterface.EXPECT().Update(context.Background(), gomock.Any()).Do(func(ctx context.Context, arg interface{}) {
+					Expect(arg.(*virtv1.VirtualMachine).Spec.Template.Spec.Volumes).To(HaveLen(1))
+					Expect(arg.(*virtv1.VirtualMachine).Spec.Template.Spec.Volumes[0].VolumeSource.EjectedCDRom).To(Not(BeNil()))
+				}).Return(vm, nil)
+			} else {
+				vmInterface.EXPECT().Update(context.Background(), gomock.Any()).Do(func(ctx context.Context, arg interface{}) {
+					Expect(arg.(*virtv1.VirtualMachine).Spec.Template.Spec.Volumes).To(BeEmpty())
+				}).Return(vm, nil)
+			}
 
 			vmInterface.EXPECT().UpdateStatus(context.Background(), gomock.Any()).Do(func(ctx context.Context, arg interface{}) {
 				// vol request shouldn't be cleared until update status observes the new volume change occured
@@ -417,8 +441,10 @@ var _ = Describe("VirtualMachine", func() {
 			controller.Execute()
 		},
 
-			Entry("that is running", true),
-			Entry("that is not running", false),
+			Entry("that is running", true, false),
+			Entry("that is not running", false, false),
+			Entry("that is running with ejectcdrom", true, true),
+			Entry("that is not running with ejectcdrom", false, true),
 		)
 
 		DescribeTable("should clear VolumeRequests for added volumes that are satisfied", func(isRunning bool) {
@@ -5075,4 +5101,18 @@ func DefaultVirtualMachine(started bool) (*virtv1.VirtualMachine, *virtv1.Virtua
 
 func markVmAsReady(vm *virtv1.VirtualMachine) {
 	virtcontroller.NewVirtualMachineConditionManager().UpdateCondition(vm, &virtv1.VirtualMachineCondition{Type: virtv1.VirtualMachineReady, Status: k8sv1.ConditionTrue})
+}
+
+func DefaultVirtualMachineWithCDRom(started bool, isEjectedCDRom bool) (*virtv1.VirtualMachine, *virtv1.VirtualMachineInstance) {
+	vm, vmi := DefaultVirtualMachineWithNames(started, "testvmi", "testvmi")
+	volumes := []virtv1.Volume{
+		{Name: "vol1"},
+	}
+	if isEjectedCDRom {
+		volumes[0].VolumeSource = virtv1.VolumeSource{EjectedCDRom: &virtv1.EjectedCDRomSource{}}
+	}
+	vmi.Spec.Volumes = volumes
+	vm.Spec.Template.Spec.Volumes = vmi.Spec.Volumes
+
+	return vm, vmi
 }

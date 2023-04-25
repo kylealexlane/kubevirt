@@ -1078,7 +1078,11 @@ func verifyVolumeOption(volumes []v1.Volume, volumeRequest *v1.VirtualMachineVol
 	for _, volume := range volumes {
 		if volumeRequest.AddVolumeOptions != nil {
 			volSourceName := volumeSourceName(volumeRequest.AddVolumeOptions.VolumeSource)
-			if volumeNameExists(volume, volumeRequest.AddVolumeOptions.Name) {
+			volNameExists := volumeNameExists(volume, volumeRequest.AddVolumeOptions.Name)
+
+			// ejected CDRoms are the only case where an a volume can match an existing
+			// volume's name
+			if volNameExists && volume.EjectedCDRom == nil {
 				return fmt.Errorf("Unable to add volume [%s] because volume with that name already exists", volumeRequest.AddVolumeOptions.Name)
 			}
 			if volumeSourceExists(volume, volSourceName) {
@@ -1111,6 +1115,50 @@ func generateVMIVolumeRequestPatch(vmi *v1.VirtualMachineInstance, volumeRequest
 
 	if len(vmi.Spec.Domain.Devices.Disks) > 0 {
 		diskVerb = "replace"
+	}
+
+	foundRemoveVol := false
+	foundEjectCDRomVol := false
+	foundInsertCDRomVol := false
+	isEjectCDRomRequest := false
+	for _, volume := range vmi.Spec.Volumes {
+		if volumeRequest.AddVolumeOptions != nil && volume.Name == volumeRequest.AddVolumeOptions.Name {
+			if controller.IsInsertCDRomRequest(volumeRequest) {
+				// If the names match and it is an insert cdrom request, then we have found the one
+				// match and can validate here.
+				if err := validateInsertableCDRom(volume, vmi.Spec.Domain.Devices.Disks); err != nil {
+					return "", err
+				}
+				foundInsertCDRomVol = true
+			} else {
+				return "", fmt.Errorf("unable to add volume [%s] because it already exists", volume.Name)
+			}
+		} else if volumeRequest.RemoveVolumeOptions != nil && volume.Name == volumeRequest.RemoveVolumeOptions.Name {
+			if controller.IsEjectCDRomRequest(volumeRequest, vmi.Spec.Domain.Devices.Disks) {
+				isEjectCDRomRequest = true
+				// If the names match and it's an eject cdrom request, then we have found the one
+				// match and can validate here.
+				if err := validateEjectableCDRom(volume, vmi.Spec.Domain.Devices.Disks, controller.GetVolumeStatus(vmi, volume.Name)); err != nil {
+					return "", err
+				} else {
+					foundEjectCDRomVol = true
+				}
+			} else {
+				foundRemoveVol = true
+			}
+		}
+	}
+
+	if volumeRequest.RemoveVolumeOptions != nil && !foundRemoveVol && !isEjectCDRomRequest {
+		return "", fmt.Errorf("unable to remove volume [%s] because it does not exist", volumeRequest.RemoveVolumeOptions.Name)
+	}
+
+	if volumeRequest.RemoveVolumeOptions != nil && !foundEjectCDRomVol && isEjectCDRomRequest {
+		return "", fmt.Errorf("unable to eject cdrom [%s] because volume does not exist", volumeRequest.RemoveVolumeOptions.Name)
+	}
+
+	if volumeRequest.AddVolumeOptions != nil && !foundInsertCDRomVol && controller.IsInsertCDRomRequest(volumeRequest) {
+		return "", fmt.Errorf("unable to insert cdrom because corresponding ejected volume [%s] does not exist", volumeRequest.AddVolumeOptions.Name)
 	}
 
 	vmiCopy := vmi.DeepCopy()
@@ -1147,6 +1195,57 @@ func generateVMIVolumeRequestPatch(vmi *v1.VirtualMachineInstance, volumeRequest
 	return patch, nil
 }
 
+func validateInsertableCDRom(volume v1.Volume, disks []v1.Disk) error {
+	if volume.EjectedCDRom == nil {
+		return fmt.Errorf("unable to insert CDRom into disk [%s] because the volume is not an ejected CDRom", volume.Name)
+	}
+
+	matchingDisk := getDisk(disks, volume.Name)
+	if matchingDisk == nil {
+		return fmt.Errorf("unable to change ejected volume [%s] to inserted because there is no corresponding disk", volume.Name)
+	}
+	if matchingDisk.CDRom == nil {
+		return fmt.Errorf("unable to change ejected volume [%s] to inserted because the corresponding disk is not of type CDRom", volume.Name)
+	}
+
+	return nil
+}
+
+func validateEjectableCDRom(volume v1.Volume, disks []v1.Disk, volumeStatus *v1.VolumeStatus) error {
+	if volume.VolumeSource.EjectedCDRom != nil {
+		return fmt.Errorf("unable to eject disk [%s] because volume %s is already ejected", volume.Name, volume.Name)
+	}
+	if !controller.IsHotpluggableVolume(volume, volumeStatus) {
+		return fmt.Errorf("unable to eject disk [%s] because volume %s is not hotpluggable / hotunpluggable", volume.Name, volume.Name)
+	}
+
+	matchingDisk := getDisk(disks, volume.Name)
+	if matchingDisk == nil {
+		return fmt.Errorf("unable to eject disk [%s] because the disk does not exist", volume.Name)
+	}
+	if matchingDisk.CDRom == nil {
+		return fmt.Errorf("unable to eject disk [%s] because the disk is not of type CDRom", volume.Name)
+	}
+
+	return nil
+}
+
+func getDisk(disks []v1.Disk, name string) *v1.Disk {
+	foundDisk := false
+	diskFound := v1.Disk{}
+	for _, disk := range disks {
+		if disk.Name == name {
+			foundDisk = true
+			diskFound = disk
+		}
+	}
+
+	if !foundDisk {
+		return nil
+	}
+	return &diskFound
+}
+
 func (app *SubresourceAPIApp) addVolumeRequestHandler(request *restful.Request, response *restful.Response, ephemeral bool) {
 	name := request.PathParameter("name")
 	namespace := request.PathParameter("namespace")
@@ -1175,15 +1274,14 @@ func (app *SubresourceAPIApp) addVolumeRequestHandler(request *restful.Request, 
 	if opts.Name == "" {
 		writeError(errors.NewBadRequest("AddVolumeOptions requires name to be set"), response)
 		return
-	} else if opts.Disk == nil {
-		writeError(errors.NewBadRequest("AddVolumeOptions requires disk to not be nil"), response)
-		return
 	} else if opts.VolumeSource == nil {
 		writeError(errors.NewBadRequest("AddVolumeOptions requires VolumeSource to not be nil"), response)
 		return
 	}
 
-	opts.Disk.Name = opts.Name
+	if opts.Disk != nil {
+		opts.Disk.Name = opts.Name
+	}
 	volumeRequest := v1.VirtualMachineVolumeRequest{
 		AddVolumeOptions: opts,
 	}

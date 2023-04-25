@@ -51,8 +51,10 @@ const (
 	COMMAND_ADDVOLUME      = "addvolume"
 	COMMAND_REMOVEVOLUME   = "removevolume"
 	COMMAND_EXPAND         = "expand"
+	COMMAND_CDROM          = "cdrom"
 
 	volumeNameArg         = "volume-name"
+	diskNameArg           = "disk-name"
 	notDefinedGracePeriod = -1
 	dryRunCommandUsage    = "--dry-run=false: Flag used to set whether to perform a dry run or not. If true the command will be executed without performing any changes."
 
@@ -62,6 +64,8 @@ const (
 	gracePeriodArg       = "grace-period"
 	serialArg            = "serial"
 	persistArg           = "persist"
+	insertArg            = "insert"
+	ejectArg             = "eject"
 	cacheArg             = "cache"
 	vmArg                = "vm"
 	filePathArg          = "file"
@@ -79,8 +83,11 @@ var (
 	forceRestart bool
 	gracePeriod  int64
 	volumeName   string
+	diskName     string
 	serial       string
 	persist      bool
+	insert       bool
+	eject        bool
 	startPaused  bool
 	dryRun       bool
 	cache        string
@@ -278,6 +285,28 @@ func NewExpandCommand(clientConfig clientcmd.ClientConfig) *cobra.Command {
 	return cmd
 }
 
+func NewCDRomCommand(clientConfig clientcmd.ClientConfig) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     "cdrom VMI",
+		Short:   "change a cdrom in a running VM",
+		Example: usageCDRom(),
+		Args:    templates.ExactArgs("cdrom", 1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c := Command{command: COMMAND_CDROM, clientConfig: clientConfig}
+			return c.Run(args)
+		},
+	}
+	cmd.SetUsageTemplate(templates.UsageTemplate())
+	cmd.Flags().StringVar(&diskName, diskNameArg, "", "name used in disks section of spec")
+	cmd.MarkFlagRequired(diskNameArg)
+	cmd.Flags().StringVar(&volumeName, volumeNameArg, "", "name used in volumes section of spec")
+	cmd.Flags().BoolVar(&persist, persistArg, false, "if set, the added volume will be persisted in the VM spec (if it exists)")
+	cmd.Flags().BoolVar(&insert, insertArg, false, "if set, the volume will be inserted into the disk cdrom drive")
+	cmd.Flags().BoolVar(&eject, ejectArg, false, "if set, the volume will be ejected from the disk cdrom drive")
+	cmd.Flags().BoolVar(&dryRun, dryRunArg, false, dryRunCommandUsage)
+	return cmd
+}
+
 func getVolumeSourceFromVolume(volumeName, namespace string, virtClient kubecli.KubevirtClient) (*v1.HotplugVolumeSource, error) {
 	//Check if data volume exists.
 	_, err := virtClient.CdiClient().CdiV1beta1().DataVolumes(namespace).Get(context.TODO(), volumeName, metav1.GetOptions{})
@@ -326,7 +355,7 @@ func usage(cmd string) string {
 func usageExpand() string {
 	return `  #Expand a virtual machine called 'myvm'.
   {{ProgramName}} expand --vm myvm
-  
+
   # Expand a virtual machine from file called myvm.yaml.
   {{ProgramName}} expand --file myvm.yaml
 
@@ -359,7 +388,19 @@ func usageRemoveVolume() string {
   `
 }
 
-func addVolume(vmiName, volumeName, namespace string, virtClient kubecli.KubevirtClient, dryRunOption *[]string) error {
+func usageCDRom() string {
+	usage := `  #Change a CDRom source which is attached to a VM.
+  {{ProgramName}} cdrom myvm --eject --disk-name=example-disk
+
+  {{ProgramName}} cdrom myvm --insert --volume-name=example-volume --disk-name=example-disk
+  `
+	return usage
+}
+
+func addVolume(vmiName, volumeName, diskName, namespace string, virtClient kubecli.KubevirtClient, dryRunOption *[]string, insertCDRom bool) error {
+	if volumeName == "" {
+		return fmt.Errorf("--volume-name argument must be set when adding a volume")
+	}
 	volumeSource, err := getVolumeSourceFromVolume(volumeName, namespace, virtClient)
 	if err != nil {
 		return fmt.Errorf("error adding volume, %v", err)
@@ -376,20 +417,27 @@ func addVolume(vmiName, volumeName, namespace string, virtClient kubecli.Kubevir
 		VolumeSource: volumeSource,
 		DryRun:       *dryRunOption,
 	}
-	if serial != "" {
-		hotplugRequest.Disk.Serial = serial
+
+	if insertCDRom {
+		hotplugRequest.Name = diskName
+		hotplugRequest.Disk = nil
 	} else {
-		hotplugRequest.Disk.Serial = volumeName
-	}
-	if cache != "" {
-		hotplugRequest.Disk.Cache = v1.DriverCache(cache)
-		// Verify if cache mode is valid
-		if hotplugRequest.Disk.Cache != v1.CacheNone &&
-			hotplugRequest.Disk.Cache != v1.CacheWriteThrough &&
-			hotplugRequest.Disk.Cache != v1.CacheWriteBack {
-			return fmt.Errorf("error adding volume, invalid cache value %s", cache)
+		if serial != "" {
+			hotplugRequest.Disk.Serial = serial
+		} else {
+			hotplugRequest.Disk.Serial = volumeName
+		}
+		if cache != "" {
+			hotplugRequest.Disk.Cache = v1.DriverCache(cache)
+			// Verify if cache mode is valid
+			if hotplugRequest.Disk.Cache != v1.CacheNone &&
+				hotplugRequest.Disk.Cache != v1.CacheWriteThrough &&
+				hotplugRequest.Disk.Cache != v1.CacheWriteBack {
+				return fmt.Errorf("error adding volume, invalid cache value %s", cache)
+			}
 		}
 	}
+
 	if !persist {
 		err = virtClient.VirtualMachineInstance(namespace).AddVolume(context.Background(), vmiName, hotplugRequest)
 	} else {
@@ -402,18 +450,19 @@ func addVolume(vmiName, volumeName, namespace string, virtClient kubecli.Kubevir
 	return nil
 }
 
-func removeVolume(vmiName, volumeName, namespace string, virtClient kubecli.KubevirtClient, dryRunOption *[]string) error {
+func removeVolume(vmiName, volumeName, diskName, namespace string, virtClient kubecli.KubevirtClient, dryRunOption *[]string, ejectCDRom bool) error {
 	var err error
+	volumeOptions := &v1.RemoveVolumeOptions{
+		Name:   volumeName,
+		DryRun: *dryRunOption,
+	}
+	if ejectCDRom {
+		volumeOptions.Name = diskName
+	}
 	if !persist {
-		err = virtClient.VirtualMachineInstance(namespace).RemoveVolume(context.Background(), vmiName, &v1.RemoveVolumeOptions{
-			Name:   volumeName,
-			DryRun: *dryRunOption,
-		})
+		err = virtClient.VirtualMachineInstance(namespace).RemoveVolume(context.Background(), vmiName, volumeOptions)
 	} else {
-		err = virtClient.VirtualMachine(namespace).RemoveVolume(context.Background(), vmiName, &v1.RemoveVolumeOptions{
-			Name:   volumeName,
-			DryRun: *dryRunOption,
-		})
+		err = virtClient.VirtualMachine(namespace).RemoveVolume(context.Background(), vmiName, volumeOptions)
 	}
 	if err != nil {
 		return fmt.Errorf("error removing volume, %v", err)
@@ -648,11 +697,19 @@ func (o *Command) Run(args []string) error {
 		fmt.Printf("%s\n", string(data))
 		return nil
 	case COMMAND_ADDVOLUME:
-		return addVolume(args[0], volumeName, namespace, virtClient, &dryRunOption)
+		return addVolume(args[0], volumeName, diskName, namespace, virtClient, &dryRunOption, false)
 	case COMMAND_REMOVEVOLUME:
-		return removeVolume(args[0], volumeName, namespace, virtClient, &dryRunOption)
+		return removeVolume(args[0], volumeName, diskName, namespace, virtClient, &dryRunOption, false)
 	case COMMAND_EXPAND:
 		return expandVirtualMachine(namespace, virtClient, o)
+	case COMMAND_CDROM:
+		if insert {
+			return addVolume(args[0], volumeName, diskName, namespace, virtClient, &dryRunOption, true)
+		}
+		if eject {
+			return removeVolume(args[0], volumeName, diskName, namespace, virtClient, &dryRunOption, true)
+		}
+		return fmt.Errorf("no --insert or --eject flag set, CDRom command must have either the --insert or --eject argument")
 	}
 
 	fmt.Printf("VM %s was scheduled to %s\n", vmiName, o.command)

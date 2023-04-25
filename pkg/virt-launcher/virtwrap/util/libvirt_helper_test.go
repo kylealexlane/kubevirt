@@ -223,8 +223,8 @@ var _ = Describe("LibvirtHelper", func() {
 			VirtualMachine:   vmi,
 			AllowEmulation:   true,
 			SMBios:           &cmdv1.SMBios{},
-			HotplugVolumes:   make(map[string]v1.VolumeStatus),
-			PermanentVolumes: make(map[string]v1.VolumeStatus),
+			HotplugVolumes:   make(map[string]*v1.VolumeStatus),
+			PermanentVolumes: make(map[string]*v1.VolumeStatus),
 		}
 		Expect(converter.Convert_v1_VirtualMachineInstance_To_api_Domain(vmi, domain, c)).To(Succeed())
 		api.NewDefaulter(runtime.GOARCH).SetObjectDefaults_Domain(domain)

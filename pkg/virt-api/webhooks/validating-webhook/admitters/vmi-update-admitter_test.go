@@ -249,23 +249,83 @@ var _ = Describe("Validating VMIUpdate Admitter", func() {
 		),
 	)
 
-	emptyResult := func() map[string]v1.Volume {
-		return make(map[string]v1.Volume, 0)
+	makeMapFromVolumes := func(volumes []v1.Volume) map[string]v1.Volume {
+		res := make(map[string]v1.Volume, 0)
+		for _, volume := range volumes {
+			res[volume.Name] = volume
+		}
+		return res
 	}
 
-	makeResult := func(indexes ...int) map[string]v1.Volume {
-		res := emptyResult()
-		for _, index := range indexes {
-			res[fmt.Sprintf("volume-name-%d", index)] = v1.Volume{
-				Name: fmt.Sprintf("volume-name-%d", index),
-				VolumeSource: v1.VolumeSource{
-					DataVolume: &v1.DataVolumeSource{
-						Name: fmt.Sprintf("dv-name-%d", index),
-					},
+	makeMapFromDisks := func(disks []v1.Disk) map[string]v1.Disk {
+		res := make(map[string]v1.Disk, 0)
+		for _, disk := range disks {
+			res[disk.Name] = disk
+		}
+		return res
+	}
+
+	makeVolume := func(name string, kind string, isHotPluggable bool) v1.Volume {
+		volume := v1.Volume{}
+		volume.Name = fmt.Sprintf("volume-name-%s", name)
+
+		if kind == "pvc" {
+			volume.VolumeSource = v1.VolumeSource{
+				PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+					Hotpluggable: isHotPluggable,
+				},
+			}
+		} else if kind == "dv" {
+			volume.VolumeSource = v1.VolumeSource{
+				DataVolume: &v1.DataVolumeSource{
+					Hotpluggable: isHotPluggable,
+					Name:         fmt.Sprintf("dv-name-%s", name),
+				},
+			}
+		} else if kind == "ejectedcdrom" {
+			volume.VolumeSource = v1.VolumeSource{
+				EjectedCDRom: &v1.EjectedCDRomSource{},
+			}
+		}
+
+		return volume
+	}
+
+	makeDisk := func(name string, isCDRom bool) v1.Disk {
+		disk := v1.Disk{}
+		disk.Name = fmt.Sprintf("volume-name-%s", name)
+
+		if isCDRom {
+			disk.DiskDevice = v1.DiskDevice{
+				CDRom: &v1.CDRomTarget{
+					Bus: "sata",
+				},
+			}
+		} else {
+			disk.DiskDevice = v1.DiskDevice{
+				Disk: &v1.DiskTarget{
+					Bus: "scsi",
 				},
 			}
 		}
-		return res
+
+		return disk
+	}
+
+	makeStatus := func(name string, isHotplug bool) v1.VolumeStatus {
+		status := v1.VolumeStatus{
+			Name:   fmt.Sprintf("volume-name-%s", name),
+			Target: fmt.Sprintf("volume-target-%s", name),
+		}
+
+		if isHotplug {
+			status.HotplugVolume = &v1.HotplugVolumeStatus{
+				AttachPodName: fmt.Sprintf("test-pod-%s", name),
+			}
+			status.Phase = v1.VolumeReady
+		}
+
+		return status
 	}
 
 	makeVolumes := func(indexes ...int) []v1.Volume {
@@ -299,35 +359,6 @@ var _ = Describe("Validating VMIUpdate Admitter", func() {
 				}
 			}
 			if !memoryDump {
-				res = append(res, v1.Volume{
-					Name: fmt.Sprintf("volume-name-%d", i),
-					VolumeSource: v1.VolumeSource{
-						DataVolume: &v1.DataVolumeSource{
-							Name: fmt.Sprintf("dv-name-%d", i),
-						},
-					},
-				})
-			}
-		}
-		return res
-	}
-
-	makeInvalidVolumes := func(total int, indexes ...int) []v1.Volume {
-		res := make([]v1.Volume, 0)
-		for i := 0; i < total; i++ {
-			foundInvalid := false
-			for _, index := range indexes {
-				if i == index {
-					foundInvalid = true
-					res = append(res, v1.Volume{
-						Name: fmt.Sprintf("volume-name-%d", index),
-						VolumeSource: v1.VolumeSource{
-							ContainerDisk: testutils.NewFakeContainerDiskSource(),
-						},
-					})
-				}
-			}
-			if !foundInvalid {
 				res = append(res, v1.Volume{
 					Name: fmt.Sprintf("volume-name-%d", i),
 					VolumeSource: v1.VolumeSource{
@@ -379,17 +410,7 @@ var _ = Describe("Validating VMIUpdate Admitter", func() {
 		return res
 	}
 
-	makeDisksNoVolume := func(indexes ...int) []v1.Disk {
-		res := make([]v1.Disk, 0)
-		for _, index := range indexes {
-			res = append(res, v1.Disk{
-				Name: fmt.Sprintf("invalid-volume-name-%d", index),
-			})
-		}
-		return res
-	}
-
-	makeStatus := func(statusCount, hotplugCount int) []v1.VolumeStatus {
+	makeStatuses := func(statusCount, hotplugCount int) []v1.VolumeStatus {
 		res := make([]v1.VolumeStatus, 0)
 		for i := 0; i < statusCount; i++ {
 			res = append(res, v1.VolumeStatus{
@@ -416,26 +437,414 @@ var _ = Describe("Validating VMIUpdate Admitter", func() {
 		})
 	}
 
-	DescribeTable("Should properly calculate the hotplugvolumes", func(volumes []v1.Volume, statuses []v1.VolumeStatus, expected map[string]v1.Volume) {
+	DescribeTable("Should calculate the hotplugvolumes", func(volumes []v1.Volume, statuses []v1.VolumeStatus, expected []v1.Volume) {
 		result := getHotplugVolumes(volumes, statuses)
-		Expect(equality.Semantic.DeepEqual(result, expected)).To(BeTrue(), "result: %v and expected: %v do not match", result, expected)
+		Expect(equality.Semantic.DeepEqual(result, makeMapFromVolumes(expected))).To(BeTrue(), "result: %v and expected: %v do not match", result, expected)
 	},
-		Entry("Should be empty if statuses is empty", makeVolumes(), makeStatus(0, 0), emptyResult()),
-		Entry("Should be empty if statuses has multiple entries, but no hotplug", makeVolumes(), makeStatus(2, 0), emptyResult()),
-		Entry("Should be empty if statuses has one entry, but no hotplug", makeVolumes(), makeStatus(1, 0), emptyResult()),
-		Entry("Should have a single hotplug if status has one hotplug", makeVolumes(0, 1), makeStatus(2, 1), makeResult(1)),
-		Entry("Should have a multiple hotplug if status has multiple hotplug", makeVolumes(0, 1, 2, 3), makeStatus(4, 2), makeResult(2, 3)),
+		Entry("Should be empty if statuses is empty", makeVolumes(), makeStatuses(0, 0), []v1.Volume{}),
+		Entry("Should be empty if statuses has multiple entries, but no hotplug", makeVolumes(), makeStatuses(2, 0), []v1.Volume{}),
+		Entry("Should be empty if statuses has one entry, but no hotplug", makeVolumes(), makeStatuses(1, 0), []v1.Volume{}),
+		Entry("Should have a single hotplug if status has one hotplug", makeVolumes(0, 1), makeStatuses(2, 1), makeVolumes(1)),
+		Entry("Should have a multiple hotplug if status has multiple hotplug", makeVolumes(0, 1, 2, 3), makeStatuses(4, 2), makeVolumes(2, 3)),
+		Entry("Should be empty if everything is empty", makeVolumes(), []v1.VolumeStatus{}, []v1.Volume{}),
+		Entry("Should be empty if there are only non-hotplugged volumes and non-hotplugged volume statuses",
+			[]v1.Volume{
+				makeVolume("vol1", "dv", false),
+				makeVolume("vol2", "pvc", false),
+			},
+			[]v1.VolumeStatus{
+				makeStatus("vol1", false),
+				makeStatus("vol2", false),
+			},
+			[]v1.Volume{},
+		),
+		Entry("Should get a hotplugged pvc",
+			[]v1.Volume{
+				makeVolume("vol1", "dv", false),
+				makeVolume("vol2", "pvc", true),
+			},
+			[]v1.VolumeStatus{
+				makeStatus("vol1", false),
+				makeStatus("vol2", false),
+			},
+			[]v1.Volume{
+				makeVolume("vol2", "pvc", true),
+			},
+		),
+		Entry("Should get a hotplugged dv",
+			[]v1.Volume{
+				makeVolume("vol1", "dv", true),
+				makeVolume("vol2", "pvc", false),
+			},
+			[]v1.VolumeStatus{
+				makeStatus("vol1", false),
+				makeStatus("vol2", false),
+			},
+			[]v1.Volume{
+				makeVolume("vol1", "dv", true),
+			},
+		),
+		Entry("Should get an ejected cdrom",
+			[]v1.Volume{
+				makeVolume("vol1", "dv", false),
+				makeVolume("vol2", "ejectedcdrom", true),
+				makeVolume("vol3", "pvc", false),
+			},
+			[]v1.VolumeStatus{
+				makeStatus("vol1", false),
+				makeStatus("vol2", false),
+				makeStatus("vol3", false),
+			},
+			[]v1.Volume{
+				makeVolume("vol2", "ejectedcdrom", true),
+			},
+		),
+		Entry("Should get multiple hotplugged volumes",
+			[]v1.Volume{
+				makeVolume("vol1", "dv", false),
+				makeVolume("vol2", "dv", true),
+				makeVolume("vol3", "ejectedcdrom", true),
+				makeVolume("vol4", "pvc", false),
+				makeVolume("vol5", "pvc", true),
+			},
+			[]v1.VolumeStatus{
+				makeStatus("vol1", false),
+				makeStatus("vol2", false),
+				makeStatus("vol3", false),
+				makeStatus("vol4", false),
+				makeStatus("vol5", false),
+			},
+			[]v1.Volume{
+				makeVolume("vol2", "dv", true),
+				makeVolume("vol3", "ejectedcdrom", true),
+				makeVolume("vol5", "pvc", true),
+			},
+		),
+		Entry("Should consider volume hotplugged if not in status",
+			[]v1.Volume{
+				makeVolume("vol1", "dv", false),
+				makeVolume("vol2", "dv", true),
+				makeVolume("vol3", "ejectedcdrom", true),
+				makeVolume("vol4", "pvc", false),
+				makeVolume("vol5", "pvc", true),
+			},
+			nil,
+			[]v1.Volume{
+				makeVolume("vol1", "dv", false),
+				makeVolume("vol2", "dv", true),
+				makeVolume("vol3", "ejectedcdrom", true),
+				makeVolume("vol4", "pvc", false),
+				makeVolume("vol5", "pvc", true),
+			},
+		),
+		Entry("Should consider volume hotplugged if hotplug in status",
+			[]v1.Volume{
+				makeVolume("vol1", "dv", false),
+			},
+			[]v1.VolumeStatus{
+				makeStatus("vol1", true),
+			},
+			[]v1.Volume{
+				makeVolume("vol1", "dv", false),
+			},
+		),
 	)
 
-	DescribeTable("Should properly calculate the permanent volumes", func(volumes []v1.Volume, statusVolumes []v1.VolumeStatus, expected map[string]v1.Volume) {
-		result := getPermanentVolumes(volumes, statusVolumes)
-		Expect(equality.Semantic.DeepEqual(result, expected)).To(BeTrue(), "result: %v and expected: %v do not match", result, expected)
+	DescribeTable("Should calculate the permanent volumes", func(volumes []v1.Volume, volumeStatuses []v1.VolumeStatus, expected []v1.Volume) {
+		result := getPermanentVolumes(volumes, volumeStatuses)
+		Expect(equality.Semantic.DeepEqual(result, makeMapFromVolumes(expected))).To(BeTrue(), "result: %v and expected: %v do not match", result, expected)
 	},
-		Entry("Should be empty if volume is empty", makeVolumes(), makeStatus(0, 0), emptyResult()),
-		Entry("Should be empty if all volumes are hotplugged", makeVolumes(0, 1, 2, 3), makeStatus(4, 4), emptyResult()),
-		Entry("Should return all volumes if hotplugged is empty with multiple volumes", makeVolumes(0, 1, 2, 3), makeStatus(4, 0), makeResult(0, 1, 2, 3)),
-		Entry("Should return all volumes if hotplugged is empty with a single volume", makeVolumes(0), makeStatus(1, 0), makeResult(0)),
-		Entry("Should return 3 volumes if  1 hotplugged volume", makeVolumes(0, 1, 2, 3), makeStatus(4, 1), makeResult(0, 1, 2)),
+		Entry("Should be empty if volume is empty", makeVolumes(), makeStatuses(0, 0), []v1.Volume{}),
+		Entry("Should be empty if all volumes are hotplugged", makeVolumes(0, 1, 2, 3), makeStatuses(4, 4), []v1.Volume{}),
+		Entry("Should return all volumes if hotplugged is empty with multiple volumes", makeVolumes(0, 1, 2, 3), makeStatuses(4, 0), makeVolumes(0, 1, 2, 3)),
+		Entry("Should return all volumes if hotplugged is empty with a single volume", makeVolumes(0), makeStatuses(1, 0), makeVolumes(0)),
+		Entry("Should return 3 volumes if  1 hotplugged volume", makeVolumes(0, 1, 2, 3), makeStatuses(4, 1), makeVolumes(0, 1, 2)),
+		Entry("Should be empty if all is empty", makeVolumes(), []v1.VolumeStatus{}, []v1.Volume{}),
+		Entry("Should be empty if there are only hotplugged volumes",
+			[]v1.Volume{
+				makeVolume("vol1", "dv", true),
+				makeVolume("vol2", "pvc", true),
+				makeVolume("vol3", "ejectedcdrom", true),
+			},
+			[]v1.VolumeStatus{
+				makeStatus("vol1", false),
+				makeStatus("vol2", false),
+				makeStatus("vol3", false),
+			},
+			[]v1.Volume{},
+		),
+		Entry("Should get a non-hotplugged pvc",
+			[]v1.Volume{
+				makeVolume("vol1", "dv", true),
+				makeVolume("vol2", "pvc", false),
+				makeVolume("vol3", "ejectedcdrom", true),
+			},
+			[]v1.VolumeStatus{
+				makeStatus("vol1", false),
+				makeStatus("vol2", false),
+				makeStatus("vol3", false),
+			},
+			[]v1.Volume{
+				makeVolume("vol2", "pvc", false),
+			},
+		),
+		Entry("Should get a non-hotplugged dv",
+			[]v1.Volume{
+				makeVolume("vol1", "dv", false),
+				makeVolume("vol2", "pvc", true),
+				makeVolume("vol3", "ejectedcdrom", true),
+			},
+			[]v1.VolumeStatus{
+				makeStatus("vol1", false),
+				makeStatus("vol2", false),
+				makeStatus("vol3", false),
+			},
+			[]v1.Volume{
+				makeVolume("vol1", "dv", false),
+			},
+		),
+		Entry("Should get multiple non-hotplugged volumes",
+			[]v1.Volume{
+				makeVolume("vol1", "dv", false),
+				makeVolume("vol2", "dv", true),
+				makeVolume("vol3", "ejectedcdrom", true),
+				makeVolume("vol4", "pvc", false),
+				makeVolume("vol5", "pvc", true),
+			},
+			[]v1.VolumeStatus{
+				makeStatus("vol1", false),
+				makeStatus("vol2", false),
+				makeStatus("vol3", false),
+				makeStatus("vol4", false),
+				makeStatus("vol5", false),
+			},
+			[]v1.Volume{
+				makeVolume("vol1", "dv", false),
+				makeVolume("vol4", "pvc", false),
+			},
+		),
+		Entry("Should be empty when all volumes are considered hotplugged due to empty status",
+			[]v1.Volume{
+				makeVolume("vol1", "dv", false),
+				makeVolume("vol2", "dv", true),
+				makeVolume("vol3", "ejectedcdrom", true),
+				makeVolume("vol4", "pvc", false),
+				makeVolume("vol5", "pvc", true),
+			},
+			[]v1.VolumeStatus{},
+			[]v1.Volume{},
+		),
+		Entry("Should ignore hotplugged volumes based on their status",
+			[]v1.Volume{
+				makeVolume("vol1", "dv", false),
+				makeVolume("vol2", "dv", false),
+				makeVolume("vol4", "pvc", false),
+				makeVolume("vol5", "pvc", false),
+			},
+			[]v1.VolumeStatus{
+				makeStatus("vol1", false),
+				makeStatus("vol2", true),
+				makeStatus("vol4", false),
+				makeStatus("vol5", true),
+			},
+			[]v1.Volume{
+				makeVolume("vol1", "dv", false),
+				makeVolume("vol4", "pvc", false),
+			},
+		),
+	)
+
+	DescribeTable("Should get inserted cdroms", func(volumes []v1.Volume, disks []v1.Disk, expected []v1.Volume) {
+		res := getInsertedCDRoms(makeMapFromVolumes(volumes), makeMapFromDisks(disks))
+		Expect(equality.Semantic.DeepEqual(res, makeMapFromVolumes(expected))).To(BeTrue(), "result: %v and expected: %v do not match", res, expected)
+	},
+		Entry("Should be empty if there are no volumes", makeVolumes(), []v1.Disk{makeDisk("vol1", true)}, []v1.Volume{}),
+		Entry("Should be empty if there are no disks", []v1.Volume{makeVolume("vol1", "dv", true)}, []v1.Disk{}, []v1.Volume{}),
+		Entry("Should ignore ejected cdroms volumes",
+			[]v1.Volume{
+				makeVolume("vol3", "ejectedcdrom", true),
+			},
+			[]v1.Disk{
+				makeDisk("vol3", true),
+			},
+			[]v1.Volume{},
+		),
+		Entry("Should get non-ejected volumes",
+			[]v1.Volume{
+				makeVolume("vol1", "dv", true),
+				makeVolume("vol5", "pvc", true),
+			},
+			[]v1.Disk{
+				makeDisk("vol1", true),
+				makeDisk("vol5", true),
+			},
+			[]v1.Volume{
+				makeVolume("vol1", "dv", true),
+				makeVolume("vol5", "pvc", true),
+			},
+		),
+		Entry("Should ignore non-cdrom corresponding disks",
+			[]v1.Volume{
+				makeVolume("vol1", "dv", true),
+				makeVolume("vol2", "dv", true),
+				makeVolume("vol4", "pvc", true),
+				makeVolume("vol5", "pvc", true),
+			},
+			[]v1.Disk{
+				makeDisk("vol1", true),
+				makeDisk("vol2", false),
+				makeDisk("vol4", false),
+				makeDisk("vol5", true),
+			},
+			[]v1.Volume{
+				makeVolume("vol1", "dv", true),
+				makeVolume("vol5", "pvc", true),
+			},
+		),
+		Entry("Should ignore non matching names volumes",
+			[]v1.Volume{
+				makeVolume("vol1", "dv", true),
+				makeVolume("vol2", "dv", true),
+				makeVolume("vol3", "ejectedcdrom", true),
+				makeVolume("vol4", "pvc", true),
+				makeVolume("vol5", "pvc", true),
+			},
+			[]v1.Disk{
+				makeDisk("vol6", true),
+				makeDisk("vol7", false),
+				makeDisk("vol8", true),
+				makeDisk("vol9", false),
+				makeDisk("vol10", true),
+			},
+			[]v1.Volume{},
+		),
+		Entry("Should follow multiple rules at once",
+			[]v1.Volume{
+				makeVolume("vol1", "dv", true),
+				makeVolume("vol2", "dv", true),
+				makeVolume("vol3", "ejectedcdrom", true),
+				makeVolume("vol4", "pvc", true),
+				makeVolume("vol5", "pvc", true),
+			},
+			[]v1.Disk{
+				makeDisk("vol1", true),
+				makeDisk("vol2", false),
+				makeDisk("vol3", true),
+				makeDisk("vol4", false),
+				makeDisk("vol9", true),
+			},
+			[]v1.Volume{
+				makeVolume("vol1", "dv", true),
+			},
+		),
+	)
+
+	DescribeTable("Should get ejected cdroms", func(volumes []v1.Volume, disks []v1.Disk, expected []v1.Volume) {
+		res := getEjectedCDRoms(makeMapFromVolumes(volumes), makeMapFromDisks(disks))
+		Expect(equality.Semantic.DeepEqual(res, makeMapFromVolumes(expected))).To(BeTrue(), "result: %v and expected: %v do not match", res, expected)
+	},
+		Entry("Should be empty if there are no volumes", makeVolumes(), []v1.Disk{makeDisk("vol1", true)}, []v1.Volume{}),
+		Entry("Should be empty if there are no disks", []v1.Volume{makeVolume("vol1", "dv", true)}, []v1.Disk{}, []v1.Volume{}),
+		Entry("Should get ejected cdroms volumes",
+			[]v1.Volume{
+				makeVolume("vol3", "ejectedcdrom", true),
+			},
+			[]v1.Disk{
+				makeDisk("vol3", true),
+			},
+			[]v1.Volume{
+				makeVolume("vol3", "ejectedcdrom", true),
+			},
+		),
+		Entry("Should ignore non-ejected volumes",
+			[]v1.Volume{
+				makeVolume("vol1", "dv", true),
+				makeVolume("vol5", "pvc", true),
+			},
+			[]v1.Disk{
+				makeDisk("vol1", true),
+				makeDisk("vol5", true),
+			},
+			[]v1.Volume{},
+		),
+		Entry("Should ignore non-cdrom corresponding disks",
+			[]v1.Volume{
+				makeVolume("vol1", "ejectedcdrom", true),
+				makeVolume("vol2", "ejectedcdrom", true),
+			},
+			[]v1.Disk{
+				makeDisk("vol1", true),
+				makeDisk("vol2", false),
+			},
+			[]v1.Volume{
+				makeVolume("vol1", "ejectedcdrom", true),
+			},
+		),
+		Entry("Should ignore non matching names volumes",
+			[]v1.Volume{
+				makeVolume("vol1", "ejectedcdrom", true),
+				makeVolume("vol2", "dv", true),
+				makeVolume("vol3", "ejectedcdrom", true),
+				makeVolume("vol4", "pvc", true),
+				makeVolume("vol5", "pvc", true),
+			},
+			[]v1.Disk{
+				makeDisk("vol6", true),
+				makeDisk("vol7", false),
+				makeDisk("vol8", true),
+				makeDisk("vol9", false),
+				makeDisk("vol10", true),
+			},
+			[]v1.Volume{},
+		),
+		Entry("Should follow multiple rules at once",
+			[]v1.Volume{
+				makeVolume("vol1", "dv", true),
+				makeVolume("vol2", "dv", true),
+				makeVolume("vol3", "ejectedcdrom", true),
+				makeVolume("vol33", "ejectedcdrom", true),
+				makeVolume("vol4", "pvc", true),
+				makeVolume("vol5", "pvc", true),
+			},
+			[]v1.Disk{
+				makeDisk("vol1", true),
+				makeDisk("vol2", false),
+				makeDisk("vol3", true),
+				makeDisk("vol33", false),
+				makeDisk("vol4", false),
+				makeDisk("vol9", true),
+			},
+			[]v1.Volume{
+				makeVolume("vol3", "ejectedcdrom", true),
+			},
+		),
+	)
+
+	DescribeTable("Should get overlap", func(volumes []v1.Volume, volumes2 []v1.Volume, expected []v1.Volume) {
+		res := getOverlap(makeMapFromVolumes(volumes), makeMapFromVolumes(volumes2))
+		Expect(equality.Semantic.DeepEqual(res, makeMapFromVolumes(expected))).To(BeTrue(), "result: %v and expected: %v do not match", res, expected)
+	},
+		Entry("Should be empty if there are no volumes", makeVolumes(), []v1.Volume{makeVolume("vol1", "dv", true)}, []v1.Volume{}),
+		Entry("Should be empty if there are no secondary volumes", []v1.Volume{makeVolume("vol1", "dv", true)}, makeVolumes(), []v1.Volume{}),
+		Entry("Should get overlap of multiple volumes",
+			[]v1.Volume{
+				makeVolume("vol1", "dv", true),
+				makeVolume("vol2", "dv", true),
+				makeVolume("notin2", "dv", true),
+			},
+			[]v1.Volume{
+				makeVolume("vol1", "dv", true),
+				makeVolume("notin1", "dv", false),
+				makeVolume("notin1", "dv", true),
+				makeVolume("notin1", "dv", false),
+				makeVolume("vol2", "dv", false),
+				makeVolume("notin1", "dv", true),
+			},
+			[]v1.Volume{
+				makeVolume("vol1", "dv", true),
+				makeVolume("vol2", "dv", true),
+			},
+		),
 	)
 
 	DescribeTable("Should return proper admission response", func(newVolumes, oldVolumes []v1.Volume, newDisks, oldDisks []v1.Disk, volumeStatuses []v1.VolumeStatus, expected *admissionv1.AdmissionResponse) {
@@ -451,85 +860,224 @@ var _ = Describe("Validating VMIUpdate Admitter", func() {
 			makeVolumes(),
 			makeDisks(),
 			makeDisks(),
-			makeStatus(0, 0),
+			[]v1.VolumeStatus{},
 			nil),
 		Entry("Should reject if #volumes != #disks",
 			makeVolumes(1, 2),
 			makeVolumes(1, 2),
 			makeDisks(1),
 			makeDisks(1),
-			makeStatus(0, 0),
+			[]v1.VolumeStatus{makeStatus("0", false)},
 			makeExpected("number of disks (1) does not equal the number of volumes (2)", "")),
 		Entry("Should reject if we remove a permanent volume",
 			makeVolumes(),
 			makeVolumes(0),
 			makeDisks(),
 			makeDisks(0),
-			makeStatus(1, 0),
+			[]v1.VolumeStatus{makeStatus("0", false)},
 			makeExpected("Number of permanent volumes has changed", "")),
 		Entry("Should reject if we add a disk without a matching volume",
-			makeVolumes(0, 1),
-			makeVolumes(0),
-			makeDisksNoVolume(0, 1),
-			makeDisksNoVolume(0),
-			makeStatus(1, 0),
-			makeExpected("Disk volume-name-1 does not exist", "")),
+			[]v1.Volume{
+				makeVolume("vol1", "dv", true),
+				makeVolume("vol2", "dv", true),
+			},
+			[]v1.Volume{
+				makeVolume("vol1", "dv", true),
+			},
+			[]v1.Disk{
+				makeDisk("vol1", false),
+				makeDisk("notmatching", false),
+			},
+			[]v1.Disk{
+				makeDisk("vol1", false),
+			},
+			[]v1.VolumeStatus{
+				makeStatus("vol1", false),
+				makeStatus("vol2", false),
+			},
+			makeExpected("Disk volume-name-vol2 does not exist", "")),
 		Entry("Should reject if we modify existing volume to be invalid",
 			makeVolumes(0, 1),
 			makeVolumes(0, 1),
-			makeDisksNoVolume(0, 1),
-			makeDisks(0, 1),
-			makeStatus(1, 0),
+			[]v1.Disk{
+				makeDisk("notmatching", false),
+				makeDisk("1", false),
+			},
+			[]v1.Disk{
+				makeDisk("0", false),
+				makeDisk("1", false),
+			},
+			[]v1.VolumeStatus{
+				makeStatus("0", false),
+				makeStatus("1", false),
+			},
 			makeExpected("permanent disk volume-name-0, changed", "")),
 		Entry("Should reject if a hotplug volume changed",
-			makeInvalidVolumes(2, 1),
-			makeVolumes(0, 1),
-			makeDisks(0, 1),
-			makeDisks(0, 1),
-			makeStatus(1, 0),
-			makeExpected("hotplug volume volume-name-1, changed", "")),
+			[]v1.Volume{
+				{
+					Name: "volume-name-vol1",
+					VolumeSource: v1.VolumeSource{
+						ContainerDisk: &v1.ContainerDiskSource{},
+					},
+				},
+				makeVolume("vol2", "dv", true),
+			},
+			[]v1.Volume{
+				makeVolume("vol1", "dv", true),
+				makeVolume("vol2", "dv", true),
+			},
+			[]v1.Disk{
+				makeDisk("vol1", false),
+				makeDisk("vol2", false),
+			},
+			[]v1.Disk{
+				makeDisk("vol1", false),
+				makeDisk("vol2", false),
+			},
+			[]v1.VolumeStatus{
+				makeStatus("vol1", true),
+				makeStatus("vol2", true),
+			},
+			makeExpected("hotplug volume volume-name-vol1, changed", "")),
 		Entry("Should reject if we add volumes that are not PVC or DV",
-			makeInvalidVolumes(2, 1),
-			makeVolumes(0),
-			makeDisks(0, 1),
-			makeDisks(0),
-			makeStatus(1, 0),
+			[]v1.Volume{
+				makeVolume("0", "dv", false),
+				{
+					Name: "volume-name-1",
+					VolumeSource: v1.VolumeSource{
+						ContainerDisk: &v1.ContainerDiskSource{},
+					},
+				},
+			},
+			[]v1.Volume{
+				makeVolume("0", "dv", false),
+			},
+			[]v1.Disk{
+				makeDisk("1", false),
+				makeDisk("0", false),
+			},
+			[]v1.Disk{
+				makeDisk("0", false),
+			},
+			[]v1.VolumeStatus{
+				makeStatus("0", true),
+				makeStatus("1", true),
+			},
 			makeExpected("volume volume-name-1 is not a PVC or DataVolume", "")),
 		Entry("Should accept if we add volumes and disk properly",
 			makeVolumes(0, 1),
 			makeVolumes(0, 1),
 			makeDisks(0, 1),
 			makeDisks(0, 1),
-			makeStatus(2, 1),
+			[]v1.VolumeStatus{
+				makeStatus("0", true),
+				makeStatus("1", true),
+			},
 			nil),
 		Entry("Should reject if we add disk with invalid bus",
 			makeVolumes(0, 1),
 			makeVolumes(0),
 			makeDisksInvalidBusLastDisk(0, 1),
 			makeDisks(0),
-			makeStatus(1, 0),
+			[]v1.VolumeStatus{
+				makeStatus("0", true),
+				makeStatus("1", true),
+			},
 			makeExpected("hotplugged Disk volume-name-1 does not use a scsi bus", "")),
 		Entry("Should reject if we add disk with invalid boot order",
 			makeVolumes(0, 1),
 			makeVolumes(0),
 			makeDisksInvalidBootOrder(0, 1),
 			makeDisks(0),
-			makeStatus(1, 0),
+			[]v1.VolumeStatus{
+				makeStatus("0", true),
+				makeStatus("1", true),
+			},
 			makeExpected("spec.domain.devices.disks[1] must have a boot order > 0, if supplied", "spec.domain.devices.disks[1].bootOrder")),
 		Entry("Should accept if memory dump volume exists without matching disk",
 			makeVolumesWithMemoryDumpVol(3, 2),
 			makeVolumes(0, 1),
 			makeDisks(0, 1),
 			makeDisks(0, 1),
-			makeStatus(3, 1),
+			[]v1.VolumeStatus{
+				makeStatus("0", true),
+				makeStatus("1", true),
+			},
 			nil),
 		Entry("Should reject if #volumes != #disks even when there is memory dump volume",
 			makeVolumesWithMemoryDumpVol(3, 2),
 			makeVolumesWithMemoryDumpVol(3, 2),
 			makeDisks(1),
 			makeDisks(1),
-			makeStatus(0, 0),
+			[]v1.VolumeStatus{
+				makeStatus("3", true),
+				makeStatus("2", true),
+			},
 			makeExpected("number of disks (1) does not equal the number of volumes (2)", "")),
+		Entry("Should reject if a cdrom is hotplugged",
+			[]v1.Volume{
+				makeVolume("vol1", "dv", true),
+				makeVolume("vol2", "dv", true),
+			},
+			[]v1.Volume{
+				makeVolume("vol1", "dv", true),
+			},
+			[]v1.Disk{
+				makeDisk("vol1", false),
+				makeDisk("vol2", true),
+			},
+			[]v1.Disk{
+				makeDisk("vol1", false),
+			},
+			[]v1.VolumeStatus{
+				makeStatus("vol1", true),
+				makeStatus("vol2", true),
+			},
+			makeExpected("new hotplugged Disk volume-name-vol2 cannot have type cdrom", "")),
+		Entry("Should accept a cdrom being ejected",
+			[]v1.Volume{
+				makeVolume("vol1", "dv", true),
+				makeVolume("vol2", "ejectedcdrom", true),
+			},
+			[]v1.Volume{
+				makeVolume("vol1", "dv", true),
+				makeVolume("vol2", "dv", true),
+			},
+			[]v1.Disk{
+				makeDisk("vol1", false),
+				makeDisk("vol2", true),
+			},
+			[]v1.Disk{
+				makeDisk("vol1", false),
+				makeDisk("vol2", true),
+			},
+			[]v1.VolumeStatus{
+				makeStatus("vol1", true),
+				makeStatus("vol2", true),
+			},
+			nil),
+		Entry("Should accept a cdrom being inserted",
+			[]v1.Volume{
+				makeVolume("vol1", "dv", true),
+				makeVolume("vol2", "dv", true),
+			},
+			[]v1.Volume{
+				makeVolume("vol1", "dv", true),
+				makeVolume("vol2", "ejectedcdrom", true),
+			},
+			[]v1.Disk{
+				makeDisk("vol1", false),
+				makeDisk("vol2", true),
+			},
+			[]v1.Disk{
+				makeDisk("vol1", false),
+				makeDisk("vol2", true),
+			},
+			[]v1.VolumeStatus{
+				makeStatus("vol1", true),
+				makeStatus("vol2", true),
+			},
+			nil),
 	)
 
 	DescribeTable("Admit or deny based on user", func(user string, expected types.GomegaMatcher) {
@@ -537,11 +1085,11 @@ var _ = Describe("Validating VMIUpdate Admitter", func() {
 		vmi.Spec.Domain.CPU = &v1.CPU{}
 		vmi.Spec.Volumes = makeVolumes(1)
 		vmi.Spec.Domain.Devices.Disks = makeDisks(1)
-		vmi.Status.VolumeStatus = makeStatus(1, 0)
+		vmi.Status.VolumeStatus = makeStatuses(1, 0)
 		updateVmi := vmi.DeepCopy()
 		updateVmi.Spec.Volumes = makeVolumes(2)
 		updateVmi.Spec.Domain.Devices.Disks = makeDisks(2)
-		updateVmi.Status.VolumeStatus = makeStatus(2, 1)
+		updateVmi.Status.VolumeStatus = makeStatuses(2, 1)
 
 		newVMIBytes, _ := json.Marshal(&updateVmi)
 		oldVMIBytes, _ := json.Marshal(&vmi)

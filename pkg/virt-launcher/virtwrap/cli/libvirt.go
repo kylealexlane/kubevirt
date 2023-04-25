@@ -489,6 +489,7 @@ type VirDomain interface {
 	AttachDeviceFlags(xml string, flags libvirt.DomainDeviceModifyFlags) error
 	DetachDevice(xml string) error
 	DetachDeviceFlags(xml string, flags libvirt.DomainDeviceModifyFlags) error
+	UpdateDeviceFlags(xml string, flags libvirt.DomainDeviceModifyFlags) error
 	DestroyFlags(flags libvirt.DomainDestroyFlags) error
 	ShutdownFlags(flags libvirt.DomainShutdownFlags) error
 	Reboot(flags libvirt.DomainRebootFlagValues) error

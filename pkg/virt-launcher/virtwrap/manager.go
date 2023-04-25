@@ -828,13 +828,26 @@ func (l *LibvirtDomainManager) generateConverterContext(vmi *v1.VirtualMachineIn
 		return nil, fmt.Errorf("failed to read pod cpuset: %v", err)
 	}
 
-	hotplugVolumes := make(map[string]v1.VolumeStatus)
-	permanentVolumes := make(map[string]v1.VolumeStatus)
+	statusMap := make(map[string]v1.VolumeStatus)
 	for _, status := range vmi.Status.VolumeStatus {
-		if status.HotplugVolume != nil {
-			hotplugVolumes[status.Name] = status
-		} else {
-			permanentVolumes[status.Name] = status
+		statusMap[status.Name] = status
+	}
+
+	hotplugVolumes := make(map[string]*v1.VolumeStatus)
+	permanentVolumes := make(map[string]*v1.VolumeStatus)
+	for _, volume := range vmi.Spec.Volumes {
+		var status *v1.VolumeStatus
+		foundStatus, ok := statusMap[volume.Name]
+		if ok {
+			status = &foundStatus
+		}
+
+		if controller.IsHotpluggableVolume(volume, status) {
+			hotplugVolumes[volume.Name] = status
+		} else if ok {
+			// Following old logic - only add to permanent volumes if it is in the
+			// statusMap, otherwise do not add to either.
+			permanentVolumes[volume.Name] = status
 		}
 	}
 
@@ -979,6 +992,15 @@ func (l *LibvirtDomainManager) SyncVMI(vmi *v1.VirtualMachineInstance, allowEmul
 	if err != nil {
 		// We need the domain but it does not exist, so create it
 		if domainerrors.IsNotFound(err) {
+			// First check if there are any unready hotplugged volumes, which would
+			// first need to be attached and ready in order to start libvirt
+			hpVolumesNotReady := unreadyHotpluggedVolumes(vmi)
+			if len(hpVolumesNotReady) > 0 {
+				msg := fmt.Sprintf("Delaying libvirt pre-start because the following hotplugged volumes are not ready yet: %v", hpVolumesNotReady)
+				log.Log.Object(vmi).Info(msg)
+				return nil, nil
+			}
+
 			domain, err = l.preStartHook(vmi, domain, false)
 			if err != nil {
 				logger.Reason(err).Error("pre start setup for VirtualMachineInstance failed.")
@@ -1055,8 +1077,13 @@ func (l *LibvirtDomainManager) SyncVMI(vmi *v1.VirtualMachineInstance, allowEmul
 		return nil, err
 	}
 
+	newEjectedCDRoms, newInsertedCDRoms := getCDRoms(domain.Spec.Devices.Disks)
+	oldEjectedCDRoms, oldInsertedCDRoms := getCDRoms(oldSpec.Devices.Disks)
+	newlyEjectedCDRoms := getOverlap(newEjectedCDRoms, oldInsertedCDRoms)
+	newlyInsertedCDRoms := getOverlap(newInsertedCDRoms, oldEjectedCDRoms)
+
 	// Look up all the disks to detach
-	for _, detachDisk := range getDetachedDisks(oldSpec.Devices.Disks, domain.Spec.Devices.Disks) {
+	for _, detachDisk := range getDetachedDisks(oldSpec.Devices.Disks, domain.Spec.Devices.Disks, newlyEjectedCDRoms, newlyInsertedCDRoms) {
 		logger.V(1).Infof("Detaching disk %s, target %s", detachDisk.Alias.GetName(), detachDisk.Target.Device)
 		detachBytes, err := xml.Marshal(detachDisk)
 		if err != nil {
@@ -1070,7 +1097,7 @@ func (l *LibvirtDomainManager) SyncVMI(vmi *v1.VirtualMachineInstance, allowEmul
 		}
 	}
 	// Look up all the disks to attach
-	for _, attachDisk := range getAttachedDisks(oldSpec.Devices.Disks, domain.Spec.Devices.Disks) {
+	for _, attachDisk := range getAttachedDisks(oldSpec.Devices.Disks, domain.Spec.Devices.Disks, newlyEjectedCDRoms, newlyInsertedCDRoms) {
 		allowAttach, err := checkIfDiskReadyToUse(getSourceFile(attachDisk))
 		if err != nil {
 			return nil, err
@@ -1079,24 +1106,61 @@ func (l *LibvirtDomainManager) SyncVMI(vmi *v1.VirtualMachineInstance, allowEmul
 			continue
 		}
 		logger.V(1).Infof("Attaching disk %s, target %s", attachDisk.Alias.GetName(), attachDisk.Target.Device)
-		// set drivers cache mode
-		err = converter.SetDriverCacheMode(&attachDisk, l.directIOChecker)
+		bytes, err := getHotplugDiskBytes(attachDisk, logger, l)
 		if err != nil {
 			return nil, err
 		}
-		err = converter.SetOptimalIOMode(&attachDisk)
+		err = dom.AttachDeviceFlags(strings.ToLower(string(bytes)), affectLiveAndConfigLibvirtFlags)
+		if err != nil {
+			logger.Reason(err).Error("attaching device")
+			return nil, err
+		}
+	}
+
+	// Eject all newly ejected CDRoms
+	for _, diskToEject := range newlyEjectedCDRoms {
+		if err := copyImmutableValuesFromOldDisk(&diskToEject, oldSpec.Devices.Disks); err != nil {
+			logger.Reason(err).Error("copying immutable values")
+			return nil, err
+		}
+
+		logger.V(1).Infof("Ejecting disk %s, target %s", diskToEject.Alias.GetName(), diskToEject.Target.Device)
+		diskBytes, err := xml.Marshal(diskToEject)
+		if err != nil {
+			logger.Reason(err).Error("marshalling eject disk failed")
+			return nil, err
+		}
+		err = dom.UpdateDeviceFlags(strings.ToLower(string(diskBytes)), affectDeviceLiveAndConfigLibvirtFlags)
+		if err != nil {
+			logger.Reason(err).Error("ejecting device")
+			return nil, err
+		}
+	}
+
+	// Insert all newly inserted CDRoms
+	for _, diskToInsert := range newlyInsertedCDRoms {
+		allowAttach, err := checkIfDiskReadyToUse(getSourceFile(diskToInsert))
+		if err != nil {
+			return nil, err
+		}
+		if !allowAttach {
+			continue
+		}
+
+		if err := copyImmutableValuesFromOldDisk(&diskToInsert, oldSpec.Devices.Disks); err != nil {
+			logger.Reason(err).Error("copying immutable values")
+			return nil, err
+		}
+
+		logger.V(1).Infof("Inserting CDRom disk %s, target %s", diskToInsert.Alias.GetName(), diskToInsert.Target.Device)
+		bytes, err := getHotplugDiskBytes(diskToInsert, logger, l)
 		if err != nil {
 			return nil, err
 		}
 
-		attachBytes, err := xml.Marshal(attachDisk)
+		err = dom.UpdateDeviceFlags(strings.ToLower(string(bytes)), affectDeviceLiveAndConfigLibvirtFlags)
 		if err != nil {
-			logger.Reason(err).Error("marshalling attached disk failed")
-			return nil, err
-		}
-		err = dom.AttachDeviceFlags(strings.ToLower(string(attachBytes)), affectDeviceLiveAndConfigLibvirtFlags)
-		if err != nil {
-			logger.Reason(err).Error("attaching device")
+			logger.Reason(err).Error("updating device")
 			return nil, err
 		}
 	}
@@ -1129,6 +1193,81 @@ func (l *LibvirtDomainManager) SyncVMI(vmi *v1.VirtualMachineInstance, allowEmul
 
 	// TODO: check if VirtualMachineInstance Spec and Domain Spec are equal or if we have to sync
 	return &oldSpec, nil
+}
+
+func unreadyHotpluggedVolumes(vmi *v1.VirtualMachineInstance) []string {
+	volumeStatusMap := make(map[string]v1.VolumeStatus)
+	for _, status := range vmi.Status.VolumeStatus {
+		volumeStatusMap[status.Name] = status
+	}
+
+	hotplugVolumesNotReady := []string{}
+	for _, volume := range vmi.Spec.Volumes {
+		var status *v1.VolumeStatus
+		foundStatus, ok := volumeStatusMap[volume.Name]
+		if ok {
+			status = &foundStatus
+		} else {
+			status = nil
+		}
+
+		if controller.IsHotpluggableVolume(volume, status) {
+			// ejected cdroms do not need to be waited for
+			if volume.EjectedCDRom != nil {
+				continue
+			}
+
+			// Need to wait until the hotplug volume is mounted / ready
+			if !ok || !(status.Phase == v1.HotplugVolumeMounted || status.Phase == v1.VolumeReady) {
+				hotplugVolumesNotReady = append(hotplugVolumesNotReady, volume.Name)
+			}
+		}
+	}
+
+	return hotplugVolumesNotReady
+}
+
+// copyImmutableValuesFromOldDisk will copy all the immutable values from the
+// matching old disk to the new disk when we are inserting or ejecting a cdrom.
+// Currently implemented to copy all values from the old disk and selectively
+// update the confirmed mutable values, since it is unclear exactly what values
+// are mutable from libvirt.
+func copyImmutableValuesFromOldDisk(newDisk *api.Disk, oldDisks []api.Disk) error {
+	for _, oldDisk := range oldDisks {
+		if oldDisk.Target.Device == newDisk.Target.Device {
+			oldDiskCopy := oldDisk.DeepCopy()
+
+			// These are some confirmed mutable values during device update.
+			oldDiskCopy.Source.File = newDisk.Source.File
+			oldDiskCopy.Driver.Type = newDisk.Driver.Type
+			oldDiskCopy.BootOrder = newDisk.BootOrder
+
+			*newDisk = *oldDiskCopy
+			return nil
+		}
+	}
+
+	return fmt.Errorf("attempting to update cdrom with target device %s, but there is no previous corresponding disk with target device %s", newDisk.Target.Device, newDisk.Target.Device)
+}
+
+func getHotplugDiskBytes(disk api.Disk, logger *log.FilteredLogger, l *LibvirtDomainManager) ([]byte, error) {
+	// set drivers cache mode
+	err := converter.SetDriverCacheMode(&disk, l.directIOChecker)
+	if err != nil {
+		return nil, err
+	}
+	err = converter.SetOptimalIOMode(&disk)
+	if err != nil {
+		return nil, err
+	}
+
+	bytes, err := xml.Marshal(disk)
+	if err != nil {
+		logger.Reason(err).Error("marshalling attached disk failed")
+		return nil, err
+	}
+
+	return bytes, nil
 }
 
 func getSourceFile(disk api.Disk) string {
@@ -1176,7 +1315,7 @@ func isHotplugDisk(disk api.Disk) bool {
 	return strings.HasPrefix(getSourceFile(disk), v1.HotplugDiskDir)
 }
 
-func getDetachedDisks(oldDisks, newDisks []api.Disk) []api.Disk {
+func getDetachedDisks(oldDisks, newDisks []api.Disk, newlyEjectedCDRoms, newlyInsertedCDRoms map[string]api.Disk) []api.Disk {
 	newDiskMap := make(map[string]api.Disk)
 	for _, disk := range newDisks {
 		file := getSourceFile(disk)
@@ -1190,14 +1329,74 @@ func getDetachedDisks(oldDisks, newDisks []api.Disk) []api.Disk {
 			continue
 		}
 		if _, ok := newDiskMap[getSourceFile(oldDisk)]; !ok {
-			// This disk got detached, add it to the list
-			res = append(res, oldDisk)
+			// Must additionally check if it is a newly ejected or inserted CDRom,
+			// because whenever a CDRom changes in this fashion the
+			// getSourceFile(..) will return a new value. Source.File is set to
+			// "" when ejected, and populated when inserted.
+			if !isNewlyInsertedOrNewlyEjectedCDRom(oldDisk.Target.Device, newlyEjectedCDRoms, newlyInsertedCDRoms) {
+				// This disk got detached and it is not an inserted or ejected CDRom,
+				// add it to the list
+				res = append(res, oldDisk)
+			}
 		}
 	}
 	return res
 }
 
-func getAttachedDisks(oldDisks, newDisks []api.Disk) []api.Disk {
+func isNewlyInsertedOrNewlyEjectedCDRom(device string, newlyEjectedCDRoms map[string]api.Disk, newlyInsertedCDRoms map[string]api.Disk) bool {
+	if device == "" {
+		return false
+	}
+
+	if _, ok := newlyEjectedCDRoms[device]; ok {
+		return true
+	}
+
+	if _, ok := newlyInsertedCDRoms[device]; ok {
+		return true
+	}
+
+	return false
+}
+
+func getOverlap(disks1, disks2 map[string]api.Disk) map[string]api.Disk {
+	overlappedDisks := make(map[string]api.Disk)
+	for dev, disk := range disks1 {
+		if _, ok := disks2[dev]; ok {
+			overlappedDisks[dev] = disk
+		}
+	}
+
+	return overlappedDisks
+}
+
+// getCDRoms will return two maps - (ejectedCDRoms, insertedCDRoms).
+// Keys: Target.Device (string).
+// Values: api.Disk.
+func getCDRoms(disks []api.Disk) (map[string]api.Disk, map[string]api.Disk) {
+	ejectedCDRoms := make(map[string]api.Disk)
+	insertedCDRoms := make(map[string]api.Disk)
+
+	for _, disk := range disks {
+		if isEjectedCDRom(disk) {
+			ejectedCDRoms[disk.Target.Device] = disk
+		} else if isInsertedCDRom(disk) {
+			insertedCDRoms[disk.Target.Device] = disk
+		}
+	}
+
+	return ejectedCDRoms, insertedCDRoms
+}
+
+func isEjectedCDRom(disk api.Disk) bool {
+	return disk.Device == "cdrom" && disk.Source.File == "" && disk.Target.Device != ""
+}
+
+func isInsertedCDRom(disk api.Disk) bool {
+	return disk.Device == "cdrom" && disk.Source.File != "" && disk.Target.Device != ""
+}
+
+func getAttachedDisks(oldDisks []api.Disk, newDisks []api.Disk, newlyEjectedCDRoms map[string]api.Disk, newlyInsertedCDRoms map[string]api.Disk) []api.Disk {
 	oldDiskMap := make(map[string]api.Disk)
 	for _, disk := range oldDisks {
 		file := getSourceFile(disk)
@@ -1211,8 +1410,15 @@ func getAttachedDisks(oldDisks, newDisks []api.Disk) []api.Disk {
 			continue
 		}
 		if _, ok := oldDiskMap[getSourceFile(newDisk)]; !ok {
-			// This disk got attached, add it to the list
-			res = append(res, newDisk)
+			// Must additionally check if it is a newly ejected or inserted CDRom,
+			// because whenever a CDRom changes in this fashion the
+			// getSourceFile(..) will return a new value. Source.File is set to
+			// "" when ejected, and populated when inserted.
+			if !isNewlyInsertedOrNewlyEjectedCDRom(newDisk.Target.Device, newlyEjectedCDRoms, newlyInsertedCDRoms) {
+				// This disk got attached and it is not an inserted or ejected CDRom,
+				// add it to the list
+				res = append(res, newDisk)
+			}
 		}
 	}
 	return res

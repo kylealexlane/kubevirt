@@ -445,6 +445,7 @@ var _ = Describe("VirtualMachine", func() {
 				Times(1)
 			vmiInterface.EXPECT().AddVolume(context.Background(), vmiName, gomock.Any()).DoAndReturn(func(ctx context.Context, arg0, arg1 interface{}) interface{} {
 				Expect(arg1.(*v1.AddVolumeOptions).Name).To(Equal(volumeName))
+				Expect(arg1.(*v1.AddVolumeOptions).Disk).To(Not(BeNil()))
 				verifyVolumeSource(arg1, useDv)
 				return nil
 			})
@@ -482,6 +483,7 @@ var _ = Describe("VirtualMachine", func() {
 				Times(1)
 			vmInterface.EXPECT().AddVolume(context.Background(), vmiName, gomock.Any()).DoAndReturn(func(ctx context.Context, arg0, arg1 interface{}) interface{} {
 				Expect(arg1.(*v1.AddVolumeOptions).Name).To(Equal(volumeName))
+				Expect(arg1.(*v1.AddVolumeOptions).Disk).To(Not(BeNil()))
 				verifyVolumeSource(arg1, useDv)
 				return nil
 			})
@@ -573,6 +575,203 @@ var _ = Describe("VirtualMachine", func() {
 		DescribeTable("removevolume should report error if call returns error according to option", func(isDryRun bool) {
 			expectVMIEndpointRemoveVolumeError("testvmi", "testvolume")
 			commandAndArgs := []string{"removevolume", "testvmi", "--volume-name=testvolume"}
+			if isDryRun {
+				commandAndArgs = append(commandAndArgs, "--dry-run")
+			}
+			cmdAdd := clientcmd.NewRepeatableVirtctlCommand(commandAndArgs...)
+			res := cmdAdd()
+			Expect(res).To(HaveOccurred())
+			Expect(res.Error()).To(ContainSubstring("error removing"))
+		},
+			Entry("with default", false),
+			Entry("with dry-run arg", true),
+		)
+	})
+
+	Context("change cdrom", func() {
+		var (
+			cdiClient  *cdifake.Clientset
+			coreClient *fake.Clientset
+		)
+		createTestDataVolume := func() *v1beta1.DataVolume {
+			return &v1beta1.DataVolume{
+				ObjectMeta: k8smetav1.ObjectMeta{
+					Name: "testvolume",
+				},
+			}
+		}
+
+		createTestPVC := func() *k8sv1.PersistentVolumeClaim {
+			return &k8sv1.PersistentVolumeClaim{
+				ObjectMeta: k8smetav1.ObjectMeta{
+					Name: "testvolume",
+				},
+			}
+		}
+
+		verifyVolumeSource := func(volumeOptions interface{}, useDv bool) {
+			if useDv {
+				Expect(volumeOptions.(*v1.AddVolumeOptions).VolumeSource.DataVolume).ToNot(BeNil())
+				Expect(volumeOptions.(*v1.AddVolumeOptions).VolumeSource.PersistentVolumeClaim).To(BeNil())
+			} else {
+				Expect(volumeOptions.(*v1.AddVolumeOptions).VolumeSource.DataVolume).To(BeNil())
+				Expect(volumeOptions.(*v1.AddVolumeOptions).VolumeSource.PersistentVolumeClaim).ToNot(BeNil())
+			}
+		}
+
+		expectVMIEndpointAddVolumeInsertCDRom := func(vmiName, diskName string, useDv bool) {
+			kubecli.MockKubevirtClientInstance.
+				EXPECT().
+				VirtualMachineInstance(k8smetav1.NamespaceDefault).
+				Return(vmiInterface).
+				Times(1)
+			vmiInterface.EXPECT().AddVolume(context.Background(), vmiName, gomock.Any()).DoAndReturn(func(ctx context.Context, arg0, arg1 interface{}) interface{} {
+				Expect(arg1.(*v1.AddVolumeOptions).Name).To(Equal(diskName))
+				Expect(arg1.(*v1.AddVolumeOptions).Disk).To(BeNil())
+				verifyVolumeSource(arg1, useDv)
+				return nil
+			})
+		}
+
+		expectVMIEndpointRemoveVolumeEjectCDRom := func(vmiName, diskName string, useDv bool) {
+			kubecli.MockKubevirtClientInstance.
+				EXPECT().
+				VirtualMachineInstance(k8smetav1.NamespaceDefault).
+				Return(vmiInterface).
+				Times(1)
+			vmiInterface.EXPECT().RemoveVolume(context.Background(), vmiName, gomock.Any()).DoAndReturn(func(ctx context.Context, arg0, arg1 interface{}) interface{} {
+				Expect(arg1.(*v1.RemoveVolumeOptions).Name).To(Equal(diskName))
+				return nil
+			})
+		}
+
+		expectVMIEndpointRemoveVolumeError := func(vmiName, diskName string) {
+			kubecli.MockKubevirtClientInstance.
+				EXPECT().
+				VirtualMachineInstance(k8smetav1.NamespaceDefault).
+				Return(vmiInterface).
+				Times(1)
+			vmiInterface.EXPECT().RemoveVolume(context.Background(), vmiName, gomock.Any()).DoAndReturn(func(ctx context.Context, arg0, arg1 interface{}) interface{} {
+				Expect(arg1.(*v1.RemoveVolumeOptions).Name).To(Equal(diskName))
+				return fmt.Errorf("error removing")
+			})
+		}
+
+		expectVMEndpointAddVolumeInsertCDRom := func(vmiName, diskName string, useDv bool) {
+			kubecli.MockKubevirtClientInstance.
+				EXPECT().
+				VirtualMachine(k8smetav1.NamespaceDefault).
+				Return(vmInterface).
+				Times(1)
+			vmInterface.EXPECT().AddVolume(context.Background(), vmiName, gomock.Any()).DoAndReturn(func(ctx context.Context, arg0, arg1 interface{}) interface{} {
+				Expect(arg1.(*v1.AddVolumeOptions).Name).To(Equal(diskName))
+				Expect(arg1.(*v1.AddVolumeOptions).Disk).To(BeNil())
+				verifyVolumeSource(arg1, useDv)
+				return nil
+			})
+		}
+
+		expectVMEndpointRemoveVolumeEjectCDRom := func(vmiName, diskName string, useDv bool) {
+			kubecli.MockKubevirtClientInstance.
+				EXPECT().
+				VirtualMachine(k8smetav1.NamespaceDefault).
+				Return(vmInterface).
+				Times(1)
+			vmInterface.EXPECT().RemoveVolume(context.Background(), vmiName, gomock.Any()).DoAndReturn(func(ctx context.Context, arg0, arg1 interface{}) interface{} {
+				Expect(arg1.(*v1.RemoveVolumeOptions).Name).To(Equal(diskName))
+				return nil
+			})
+		}
+
+		BeforeEach(func() {
+			cdiClient = cdifake.NewSimpleClientset()
+			coreClient = fake.NewSimpleClientset()
+		})
+
+		DescribeTable("should fail with missing required or invalid parameters", func(commandName, errorString string, args ...string) {
+			commandAndArgs := []string{commandName}
+			commandAndArgs = append(commandAndArgs, args...)
+			cmdAdd := clientcmd.NewRepeatableVirtctlCommand(commandAndArgs...)
+			res := cmdAdd()
+			Expect(res).To(HaveOccurred())
+			Expect(res.Error()).To(ContainSubstring(errorString))
+		},
+			Entry("cdrom no args", "cdrom", "argument validation failed"),
+			Entry("cdrom name, missing required disk-name", "cdrom", "required flag(s)", "testvmi"),
+			Entry("cdrom name, missing either --insert or --eject", "cdrom", "no --insert or --eject flag set", "testvmi", "--disk-name=test"),
+			Entry("cdrom name, invalid extra parameter", "cdrom", "unknown flag", "testvmi", "--disk-name=blah", "--invalid=test"),
+		)
+
+		DescribeTable("should fail cdrom --insert when no source is found according to option", func(isDryRun bool) {
+			kubecli.MockKubevirtClientInstance.EXPECT().CdiClient().Return(cdiClient)
+			kubecli.MockKubevirtClientInstance.EXPECT().CoreV1().Return(coreClient.CoreV1())
+			commandAndArgs := []string{"cdrom", "testvmi", "--insert", "--volume-name=testvolume", "--disk-name=testdisk"}
+			if isDryRun {
+				commandAndArgs = append(commandAndArgs, "--dry-run")
+			}
+			cmdAdd := clientcmd.NewRepeatableVirtctlCommand(commandAndArgs...)
+			res := cmdAdd()
+			Expect(res).To(HaveOccurred())
+			Expect(res.Error()).To(ContainSubstring("Volume testvolume is not a DataVolume or PersistentVolumeClaim"))
+		},
+			Entry("with default", false),
+			Entry("with dry-run arg", true),
+		)
+
+		DescribeTable("should fail cdrom --insert when --volume-name is not given", func(isDryRun bool) {
+			commandAndArgs := []string{"cdrom", "testvmi", "--insert", "--disk-name=testdisk"}
+			if isDryRun {
+				commandAndArgs = append(commandAndArgs, "--dry-run")
+			}
+			cmdAdd := clientcmd.NewRepeatableVirtctlCommand(commandAndArgs...)
+			res := cmdAdd()
+			Expect(res).To(HaveOccurred())
+			Expect(res.Error()).To(ContainSubstring("--volume-name argument must be set"))
+		},
+			Entry("with default", false),
+			Entry("with dry-run arg", true),
+		)
+
+		DescribeTable("should call correct endpoint", func(vmiName, diskName string, useDv bool, insert bool, expectFunc func(vmiName, diskName string, useDv bool), args ...string) {
+			flag := "--eject"
+			if insert {
+				flag = "--insert"
+				kubecli.MockKubevirtClientInstance.EXPECT().CdiClient().Return(cdiClient)
+				if useDv {
+					cdiClient.CdiV1beta1().DataVolumes(k8smetav1.NamespaceDefault).Create(context.Background(), createTestDataVolume(), k8smetav1.CreateOptions{})
+				} else {
+					kubecli.MockKubevirtClientInstance.EXPECT().CoreV1().Return(coreClient.CoreV1())
+					coreClient.CoreV1().PersistentVolumeClaims(k8smetav1.NamespaceDefault).Create(context.Background(), createTestPVC(), k8smetav1.CreateOptions{})
+				}
+			}
+			expectFunc(vmiName, diskName, useDv)
+			commandAndArgs := []string{"cdrom", vmiName, flag}
+			commandAndArgs = append(commandAndArgs, args...)
+			cmd := clientcmd.NewVirtctlCommand(commandAndArgs...)
+			Expect(cmd.Execute()).To(Succeed())
+		},
+			Entry("cdrom --insert dv, no persist should call VMI endpoint", "testvmi", "testdisk", true, true, expectVMIEndpointAddVolumeInsertCDRom, "--insert", "--volume-name=testvolume", "--disk-name=testdisk"),
+			Entry("cdrom --insert pvc, no persist should call VMI endpoint", "testvmi", "testdisk", false, true, expectVMIEndpointAddVolumeInsertCDRom, "--insert", "--volume-name=testvolume", "--disk-name=testdisk"),
+			Entry("cdrom --insert dv, with persist should call VM endpoint", "testvmi", "testdisk", true, true, expectVMEndpointAddVolumeInsertCDRom, "--insert", "--volume-name=testvolume", "--disk-name=testdisk", "--persist"),
+			Entry("cdrom --insert pvc, with persist should call VM endpoint", "testvmi", "testdisk", false, true, expectVMEndpointAddVolumeInsertCDRom, "--insert", "--volume-name=testvolume", "--disk-name=testdisk", "--persist"),
+			Entry("cdrom --eject dv, no persist should call VMI endpoint", "testvmi", "testdisk", true, false, expectVMIEndpointRemoveVolumeEjectCDRom, "--eject", "--disk-name=testdisk"),
+			Entry("cdrom --eject pvc, no persist should call VMI endpoint", "testvmi", "testdisk", false, false, expectVMIEndpointRemoveVolumeEjectCDRom, "--eject", "--disk-name=testdisk"),
+			Entry("cdrom --eject dv, with persist should call VM endpoint", "testvmi", "testdisk", true, false, expectVMEndpointRemoveVolumeEjectCDRom, "--eject", "--disk-name=testdisk", "--persist"),
+			Entry("cdrom --eject pvc, with persist should call VM endpoint", "testvmi", "testdisk", false, false, expectVMEndpointRemoveVolumeEjectCDRom, "--eject", "--disk-name=testdisk", "--persist"),
+
+			Entry("cdrom --insert dv, no persist with dry-run should call VMI endpoint", "testvmi", "testdisk", true, true, expectVMIEndpointAddVolumeInsertCDRom, "--insert", "--volume-name=testvolume", "--disk-name=testdisk", "--dry-run"),
+			Entry("cdrom --insert pvc, no persist with dry-run should call VMI endpoint", "testvmi", "testdisk", false, true, expectVMIEndpointAddVolumeInsertCDRom, "--insert", "--volume-name=testvolume", "--disk-name=testdisk", "--dry-run"),
+			Entry("cdrom --insert dv, with persist with dry-run should call VM endpoint", "testvmi", "testdisk", true, true, expectVMEndpointAddVolumeInsertCDRom, "--insert", "--volume-name=testvolume", "--disk-name=testdisk", "--persist", "--dry-run"),
+			Entry("cdrom --insert pvc, with persist with dry-run should call VM endpoint", "testvmi", "testdisk", false, true, expectVMEndpointAddVolumeInsertCDRom, "--insert", "--volume-name=testvolume", "--disk-name=testdisk", "--persist", "--dry-run"),
+			Entry("cdrom --eject dv, no persist with dry-run should call VMI endpoint", "testvmi", "testdisk", true, false, expectVMIEndpointRemoveVolumeEjectCDRom, "--eject", "--disk-name=testdisk", "--dry-run"),
+			Entry("cdrom --eject pvc, no persist with dry-run should call VMI endpoint", "testvmi", "testdisk", false, false, expectVMIEndpointRemoveVolumeEjectCDRom, "--eject", "--disk-name=testdisk", "--dry-run"),
+			Entry("cdrom --eject dv, with persist with dry-run should call VM endpoint", "testvmi", "testdisk", true, false, expectVMEndpointRemoveVolumeEjectCDRom, "--eject", "--disk-name=testdisk", "--persist", "--dry-run"),
+			Entry("cdrom --eject pvc, with persist with dry-run should call VM endpoint", "testvmi", "testdisk", false, false, expectVMEndpointRemoveVolumeEjectCDRom, "--eject", "--disk-name=testdisk", "--persist", "--dry-run"),
+		)
+
+		DescribeTable("cdrom --eject should report error if call returns error according to option", func(isDryRun bool) {
+			expectVMIEndpointRemoveVolumeError("testvmi", "testdisk")
+			commandAndArgs := []string{"cdrom", "--eject", "testvmi", "--disk-name=testdisk"}
 			if isDryRun {
 				commandAndArgs = append(commandAndArgs, "--dry-run")
 			}

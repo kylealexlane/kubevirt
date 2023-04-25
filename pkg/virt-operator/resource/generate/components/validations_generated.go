@@ -7144,6 +7144,10 @@ var CRDsValidation map[string]string = map[string]string{
                           The disk content is compatible with vhostmd (https://github.com/vhostmd/vhostmd)
                           and vm-dump-metrics.
                         type: object
+                      ejectedCDRom:
+                        description: EjectedCDRom represents an empty source for a
+                          CDRom which was previously ejected.
+                        type: object
                       emptyDisk:
                         description: 'EmptyDisk represents a temporary disk which
                           shares the vmis lifecycle. More info: https://kubevirt.gitbooks.io/user-guide/disks-and-volumes.html'
@@ -11531,6 +11535,10 @@ var CRDsValidation map[string]string = map[string]string{
                   contains a limited view of host and guest metrics. The disk content
                   is compatible with vhostmd (https://github.com/vhostmd/vhostmd)
                   and vm-dump-metrics.
+                type: object
+              ejectedCDRom:
+                description: EjectedCDRom represents an empty source for a CDRom which
+                  was previously ejected.
                 type: object
               emptyDisk:
                 description: 'EmptyDisk represents a temporary disk which shares the
@@ -16395,6 +16403,10 @@ var CRDsValidation map[string]string = map[string]string{
                           The disk content is compatible with vhostmd (https://github.com/vhostmd/vhostmd)
                           and vm-dump-metrics.
                         type: object
+                      ejectedCDRom:
+                        description: EjectedCDRom represents an empty source for a
+                          CDRom which was previously ejected.
+                        type: object
                       emptyDisk:
                         description: 'EmptyDisk represents a temporary disk which
                           shares the vmis lifecycle. More info: https://kubevirt.gitbooks.io/user-guide/disks-and-volumes.html'
@@ -20748,6 +20760,10 @@ var CRDsValidation map[string]string = map[string]string{
                                   guest metrics. The disk content is compatible with
                                   vhostmd (https://github.com/vhostmd/vhostmd) and
                                   vm-dump-metrics.
+                                type: object
+                              ejectedCDRom:
+                                description: EjectedCDRom represents an empty source
+                                  for a CDRom which was previously ejected.
                                 type: object
                               emptyDisk:
                                 description: 'EmptyDisk represents a temporary disk
@@ -25867,6 +25883,10 @@ var CRDsValidation map[string]string = map[string]string{
                                       host and guest metrics. The disk content is
                                       compatible with vhostmd (https://github.com/vhostmd/vhostmd)
                                       and vm-dump-metrics.
+                                    type: object
+                                  ejectedCDRom:
+                                    description: EjectedCDRom represents an empty
+                                      source for a CDRom which was previously ejected.
                                     type: object
                                   emptyDisk:
                                     description: 'EmptyDisk represents a temporary

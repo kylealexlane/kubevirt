@@ -378,6 +378,10 @@ const (
 	MemoryDumpVolumeInProgress VolumePhase = "MemoryDumpInProgress"
 	// MemoryDumpVolumeInProgress means that the volume for the memory dump was attached, and now the command is being triggered
 	MemoryDumpVolumeFailed VolumePhase = "MemoryDumpFailed"
+	// EjectingCDRom means that the virt-launcher pod is currently ejecting the CDRom device.
+	EjectingCDRom VolumePhase = "EjectingCDRom"
+	// EjectedCDRom means that the virt-launcher pod has an EjectedCDRom device attached.
+	EjectedCDRom VolumePhase = "EjectedCDRom"
 )
 
 func (v *VirtualMachineInstance) IsScheduling() bool {

@@ -717,7 +717,7 @@ var _ = Describe("VirtualMachineInstance Subresources", func() {
 			request.PathParameters()["namespace"] = k8smetav1.NamespaceDefault
 		})
 
-		DescribeTable("Should succeed with add volume request", func(addOpts *v1.AddVolumeOptions, removeOpts *v1.RemoveVolumeOptions, isVM bool, code int, enableGate bool) {
+		DescribeTable("Should have correct response with volume request", func(addOpts *v1.AddVolumeOptions, removeOpts *v1.RemoveVolumeOptions, isVM bool, code int, enableGate bool, ejectCDRom bool) {
 
 			if enableGate {
 				enableFeatureGate(virtconfig.HotplugVolumesGate)
@@ -737,6 +737,18 @@ var _ = Describe("VirtualMachineInstance Subresources", func() {
 			vmi.Spec.Domain.Devices.Disks = append(vmi.Spec.Domain.Devices.Disks, v1.Disk{
 				Name: "hotpluggedPVC",
 			})
+			vmi.Spec.Domain.Devices.Disks = append(vmi.Spec.Domain.Devices.Disks, v1.Disk{
+				Name: "insertedCDRom",
+				DiskDevice: v1.DiskDevice{
+					CDRom: &v1.CDRomTarget{},
+				},
+			})
+			vmi.Spec.Domain.Devices.Disks = append(vmi.Spec.Domain.Devices.Disks, v1.Disk{
+				Name: "ejectedCDRom",
+				DiskDevice: v1.DiskDevice{
+					CDRom: &v1.CDRomTarget{},
+				},
+			})
 			vmi.Spec.Volumes = append(vmi.Spec.Volumes, v1.Volume{
 				Name: "existingvol",
 				VolumeSource: v1.VolumeSource{
@@ -754,6 +766,23 @@ var _ = Describe("VirtualMachineInstance Subresources", func() {
 						},
 						Hotpluggable: true,
 					},
+				},
+			})
+			vmi.Spec.Volumes = append(vmi.Spec.Volumes, v1.Volume{
+				Name: "insertedCDRom",
+				VolumeSource: v1.VolumeSource{
+					PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+						PersistentVolumeClaimVolumeSource: k8sv1.PersistentVolumeClaimVolumeSource{
+							ClaimName: "cdrompvcdiskclaim",
+						},
+						Hotpluggable: true,
+					},
+				},
+			})
+			vmi.Spec.Volumes = append(vmi.Spec.Volumes, v1.Volume{
+				Name: "ejectedCDRom",
+				VolumeSource: v1.VolumeSource{
+					EjectedCDRom: &v1.EjectedCDRomSource{},
 				},
 			})
 
@@ -814,105 +843,119 @@ var _ = Describe("VirtualMachineInstance Subresources", func() {
 				Name:         "vol1",
 				Disk:         &v1.Disk{},
 				VolumeSource: &v1.HotplugVolumeSource{},
-			}, nil, true, http.StatusAccepted, true),
+			}, nil, true, http.StatusAccepted, true, false),
 			Entry("VMI with a valid add volume request", &v1.AddVolumeOptions{
 				Name:         "vol1",
 				Disk:         &v1.Disk{},
 				VolumeSource: &v1.HotplugVolumeSource{},
-			}, nil, false, http.StatusAccepted, true),
+			}, nil, false, http.StatusAccepted, true, false),
 			Entry("VMI with an invalid add volume request that's missing a name", &v1.AddVolumeOptions{
 				VolumeSource: &v1.HotplugVolumeSource{},
 				Disk:         &v1.Disk{},
-			}, nil, false, http.StatusBadRequest, true),
-			Entry("VMI with an invalid add volume request that's missing a disk", &v1.AddVolumeOptions{
-				Name:         "vol1",
-				VolumeSource: &v1.HotplugVolumeSource{},
-			}, nil, false, http.StatusBadRequest, true),
+			}, nil, false, http.StatusBadRequest, true, false),
 			Entry("VMI with an invalid add volume request that's missing a volume", &v1.AddVolumeOptions{
 				Name: "vol1",
 				Disk: &v1.Disk{},
-			}, nil, false, http.StatusBadRequest, true),
+			}, nil, false, http.StatusBadRequest, true, false),
 			Entry("VM with a valid remove volume request", nil, &v1.RemoveVolumeOptions{
 				Name: "hotpluggedPVC",
-			}, true, http.StatusAccepted, true),
+			}, true, http.StatusAccepted, true, false),
 			Entry("VMI with a valid remove volume request", nil, &v1.RemoveVolumeOptions{
 				Name: "hotpluggedPVC",
-			}, false, http.StatusAccepted, true),
-			Entry("VMI with a invalid remove volume request missing a name", nil, &v1.RemoveVolumeOptions{}, false, http.StatusBadRequest, true),
+			}, false, http.StatusAccepted, true, false),
+			Entry("VMI with a invalid remove volume request missing a name", nil, &v1.RemoveVolumeOptions{}, false, http.StatusBadRequest, true, false),
 			Entry("VMI with a valid remove volume request but no feature gate", nil, &v1.RemoveVolumeOptions{
 				Name: "existingvol",
-			}, false, http.StatusBadRequest, false),
+			}, false, http.StatusBadRequest, false, false),
 			Entry("VM with a valid add volume request but no feature gate", &v1.AddVolumeOptions{
 				Name:         "vol1",
 				Disk:         &v1.Disk{},
 				VolumeSource: &v1.HotplugVolumeSource{},
-			}, nil, true, http.StatusBadRequest, false),
+			}, nil, true, http.StatusBadRequest, false, false),
 			Entry("VM with a valid add volume request with DryRun", &v1.AddVolumeOptions{
 				Name:         "vol1",
 				Disk:         &v1.Disk{},
 				VolumeSource: &v1.HotplugVolumeSource{},
 				DryRun:       getDryRunOption(),
-			}, nil, true, http.StatusAccepted, true),
+			}, nil, true, http.StatusAccepted, true, false),
 			Entry("VMI with a valid add volume request with DryRun", &v1.AddVolumeOptions{
 				Name:         "vol1",
 				Disk:         &v1.Disk{},
 				VolumeSource: &v1.HotplugVolumeSource{},
 				DryRun:       getDryRunOption(),
-			}, nil, false, http.StatusAccepted, true),
+			}, nil, false, http.StatusAccepted, true, false),
 			Entry("VMI with an invalid add volume request that's missing a name with DryRun", &v1.AddVolumeOptions{
 				VolumeSource: &v1.HotplugVolumeSource{},
 				Disk:         &v1.Disk{},
 				DryRun:       getDryRunOption(),
-			}, nil, false, http.StatusBadRequest, true),
-			Entry("VMI with an invalid add volume request that's missing a disk with DryRun", &v1.AddVolumeOptions{
-				Name:         "vol1",
-				VolumeSource: &v1.HotplugVolumeSource{},
-				DryRun:       getDryRunOption(),
-			}, nil, false, http.StatusBadRequest, true),
+			}, nil, false, http.StatusBadRequest, true, false),
 			Entry("VMI with an invalid add volume request that's missing a volume with DryRun", &v1.AddVolumeOptions{
 				Name:   "vol1",
 				Disk:   &v1.Disk{},
 				DryRun: getDryRunOption(),
-			}, nil, false, http.StatusBadRequest, true),
+			}, nil, false, http.StatusBadRequest, true, false),
 			Entry("VM with a valid remove volume request with DryRun", nil, &v1.RemoveVolumeOptions{
 				Name:   "hotpluggedPVC",
 				DryRun: getDryRunOption(),
-			}, true, http.StatusAccepted, true),
+			}, true, http.StatusAccepted, true, false),
 			Entry("VMI with a valid remove volume request with DryRun", nil, &v1.RemoveVolumeOptions{
 				Name:   "hotpluggedPVC",
 				DryRun: getDryRunOption(),
-			}, false, http.StatusAccepted, true),
+			}, false, http.StatusAccepted, true, false),
 			Entry("VMI with a invalid remove volume request missing a name with DryRun", nil, &v1.RemoveVolumeOptions{
 				DryRun: getDryRunOption(),
-			}, false, http.StatusBadRequest, true),
+			}, false, http.StatusBadRequest, true, false),
 			Entry("VMI with a valid remove volume request but no feature gate with DryRun", nil, &v1.RemoveVolumeOptions{
 				Name:   "existingvol",
 				DryRun: getDryRunOption(),
-			}, false, http.StatusBadRequest, false),
+			}, false, http.StatusBadRequest, false, false),
 			Entry("VM with a valid add volume request but no feature gate with DryRun", &v1.AddVolumeOptions{
 				Name:         "vol1",
 				Disk:         &v1.Disk{},
 				VolumeSource: &v1.HotplugVolumeSource{},
 				DryRun:       getDryRunOption(),
-			}, nil, true, http.StatusBadRequest, false),
+			}, nil, true, http.StatusBadRequest, false, false),
+			Entry("VM with a valid add volume request that's missing a disk to insert a cdrom", &v1.AddVolumeOptions{
+				Name:         "ejectedCDRom",
+				VolumeSource: &v1.HotplugVolumeSource{},
+			}, nil, true, http.StatusAccepted, true, false),
+			Entry("VMI with a valid add volume request that's missing a disk to insert a cdrom", &v1.AddVolumeOptions{
+				Name:         "ejectedCDRom",
+				VolumeSource: &v1.HotplugVolumeSource{},
+			}, nil, false, http.StatusAccepted, true, false),
+			Entry("VMI with an valid remove volume request to eject a cdrom", nil, &v1.RemoveVolumeOptions{
+				Name: "insertedCDRom",
+			}, false, http.StatusAccepted, true, true),
+			Entry("VM with an valid remove volume request to eject a cdrom", nil, &v1.RemoveVolumeOptions{
+				Name: "insertedCDRom",
+			}, true, http.StatusAccepted, true, true),
 		)
 
-		DescribeTable("Should generate expected vmi patch", func(volumeRequest *v1.VirtualMachineVolumeRequest, expectedPatch string, expectError bool) {
+		DescribeTable("Should generate expected vmi patch", func(volumeRequest *v1.VirtualMachineVolumeRequest, expectedPatch string, expectError bool, vmiVolume *v1.Volume, vmiDisk *v1.Disk) {
 
 			vmi := api.NewMinimalVMI(request.PathParameter("name"))
 			vmi.Namespace = k8smetav1.NamespaceDefault
 			vmi.Status.Phase = v1.Running
-			vmi.Spec.Domain.Devices.Disks = append(vmi.Spec.Domain.Devices.Disks, v1.Disk{
-				Name: "existingvol",
-			})
-			vmi.Spec.Volumes = append(vmi.Spec.Volumes, v1.Volume{
-				Name: "existingvol",
-				VolumeSource: v1.VolumeSource{
-					PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{PersistentVolumeClaimVolumeSource: k8sv1.PersistentVolumeClaimVolumeSource{
-						ClaimName: "testpvcdiskclaim",
-					}},
-				},
-			})
+			if vmiDisk == nil {
+				vmi.Spec.Domain.Devices.Disks = append(vmi.Spec.Domain.Devices.Disks, v1.Disk{
+					Name: "existingvol",
+				})
+			} else {
+				vmi.Spec.Domain.Devices.Disks = append(vmi.Spec.Domain.Devices.Disks, *vmiDisk)
+			}
+
+			if vmiVolume == nil {
+				vmi.Spec.Volumes = append(vmi.Spec.Volumes, v1.Volume{
+					Name: "existingvol",
+					VolumeSource: v1.VolumeSource{
+						PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{PersistentVolumeClaimVolumeSource: k8sv1.PersistentVolumeClaimVolumeSource{
+							ClaimName: "testpvcdiskclaim",
+						}},
+					},
+				})
+			} else {
+				vmi.Spec.Volumes = append(vmi.Spec.Volumes, *vmiVolume)
+			}
 
 			patch, err := generateVMIVolumeRequestPatch(vmi, volumeRequest)
 			if expectError {
@@ -932,7 +975,7 @@ var _ = Describe("VirtualMachineInstance Subresources", func() {
 					},
 				},
 				"[{ \"op\": \"test\", \"path\": \"/spec/volumes\", \"value\": [{\"name\":\"existingvol\",\"persistentVolumeClaim\":{\"claimName\":\"testpvcdiskclaim\"}}]}, { \"op\": \"test\", \"path\": \"/spec/domain/devices/disks\", \"value\": [{\"name\":\"existingvol\"}]}, { \"op\": \"replace\", \"path\": \"/spec/volumes\", \"value\": [{\"name\":\"existingvol\",\"persistentVolumeClaim\":{\"claimName\":\"testpvcdiskclaim\"}},{\"name\":\"vol1\"}]}, { \"op\": \"replace\", \"path\": \"/spec/domain/devices/disks\", \"value\": [{\"name\":\"existingvol\"},{\"name\":\"vol1\"}]}]",
-				false),
+				false, nil, nil),
 			Entry("remove volume request",
 				&v1.VirtualMachineVolumeRequest{
 					RemoveVolumeOptions: &v1.RemoveVolumeOptions{
@@ -940,7 +983,397 @@ var _ = Describe("VirtualMachineInstance Subresources", func() {
 					},
 				},
 				"[{ \"op\": \"test\", \"path\": \"/spec/volumes\", \"value\": [{\"name\":\"existingvol\",\"persistentVolumeClaim\":{\"claimName\":\"testpvcdiskclaim\"}}]}, { \"op\": \"test\", \"path\": \"/spec/domain/devices/disks\", \"value\": [{\"name\":\"existingvol\"}]}, { \"op\": \"replace\", \"path\": \"/spec/volumes\", \"value\": []}, { \"op\": \"replace\", \"path\": \"/spec/domain/devices/disks\", \"value\": []}]",
-				false),
+				false, nil, nil),
+			Entry("remove volume that doesn't exist",
+				&v1.VirtualMachineVolumeRequest{
+					RemoveVolumeOptions: &v1.RemoveVolumeOptions{
+						Name: "non-existent",
+					},
+				},
+				"",
+				true, nil, nil),
+			Entry("add a volume that already exists",
+				&v1.VirtualMachineVolumeRequest{
+					AddVolumeOptions: &v1.AddVolumeOptions{
+						Name:         "existingvol",
+						Disk:         &v1.Disk{},
+						VolumeSource: &v1.HotplugVolumeSource{},
+					},
+				},
+				"",
+				true, nil, nil),
+			Entry("add volume request with insert cdrom",
+				&v1.VirtualMachineVolumeRequest{
+					AddVolumeOptions: &v1.AddVolumeOptions{
+						Name:         "existingvol",
+						VolumeSource: &v1.HotplugVolumeSource{},
+					},
+				},
+				"[{ \"op\": \"test\", \"path\": \"/spec/volumes\", \"value\": [{\"name\":\"existingvol\",\"ejectedCDRom\":{}}]}, { \"op\": \"test\", \"path\": \"/spec/domain/devices/disks\", \"value\": [{\"name\":\"existingvol\",\"cdrom\":{}}]}, { \"op\": \"replace\", \"path\": \"/spec/volumes\", \"value\": [{\"name\":\"existingvol\"}]}, { \"op\": \"replace\", \"path\": \"/spec/domain/devices/disks\", \"value\": [{\"name\":\"existingvol\",\"cdrom\":{}}]}]",
+				false,
+				&v1.Volume{
+					Name: "existingvol",
+					VolumeSource: v1.VolumeSource{
+						EjectedCDRom: &v1.EjectedCDRomSource{},
+					},
+				},
+				&v1.Disk{
+					Name: "existingvol",
+					DiskDevice: v1.DiskDevice{
+						CDRom: &v1.CDRomTarget{},
+					},
+				},
+			),
+			Entry("remove volume request with eject cdrom",
+				&v1.VirtualMachineVolumeRequest{
+					RemoveVolumeOptions: &v1.RemoveVolumeOptions{
+						Name: "existingvol",
+					},
+				},
+				"[{ \"op\": \"test\", \"path\": \"/spec/volumes\", \"value\": [{\"name\":\"existingvol\",\"persistentVolumeClaim\":{\"claimName\":\"testpvcdiskclaim\",\"hotpluggable\":true}}]}, { \"op\": \"test\", \"path\": \"/spec/domain/devices/disks\", \"value\": [{\"name\":\"existingvol\",\"cdrom\":{}}]}, { \"op\": \"replace\", \"path\": \"/spec/volumes\", \"value\": [{\"name\":\"existingvol\",\"ejectedCDRom\":{}}]}, { \"op\": \"replace\", \"path\": \"/spec/domain/devices/disks\", \"value\": [{\"name\":\"existingvol\",\"cdrom\":{}}]}]",
+				false,
+				&v1.Volume{
+					Name: "existingvol",
+					VolumeSource: v1.VolumeSource{
+						PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+							PersistentVolumeClaimVolumeSource: k8sv1.PersistentVolumeClaimVolumeSource{
+								ClaimName: "testpvcdiskclaim",
+							},
+							Hotpluggable: true,
+						},
+					},
+				},
+				&v1.Disk{
+					Name: "existingvol",
+					DiskDevice: v1.DiskDevice{
+						CDRom: &v1.CDRomTarget{},
+					},
+				},
+			),
+			Entry("add volume request with insert cdrom when matching volume does not exist",
+				&v1.VirtualMachineVolumeRequest{
+					AddVolumeOptions: &v1.AddVolumeOptions{
+						Name:         "newvol",
+						VolumeSource: &v1.HotplugVolumeSource{},
+					},
+				},
+				"",
+				true,
+				&v1.Volume{
+					Name: "existingvol",
+					VolumeSource: v1.VolumeSource{
+						EjectedCDRom: &v1.EjectedCDRomSource{},
+					},
+				},
+				&v1.Disk{
+					Name: "existingvol",
+					DiskDevice: v1.DiskDevice{
+						CDRom: &v1.CDRomTarget{},
+					},
+				},
+			),
+			Entry("remove volume request with eject cdrom when matching volume does not exist",
+				&v1.VirtualMachineVolumeRequest{
+					RemoveVolumeOptions: &v1.RemoveVolumeOptions{
+						Name: "newvol",
+					},
+				},
+				"",
+				true,
+				&v1.Volume{
+					Name: "existingvol",
+					VolumeSource: v1.VolumeSource{
+						PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+							PersistentVolumeClaimVolumeSource: k8sv1.PersistentVolumeClaimVolumeSource{
+								ClaimName: "testpvcdiskclaim",
+							},
+							Hotpluggable: true,
+						},
+					},
+				},
+				&v1.Disk{
+					Name: "existingvol",
+					DiskDevice: v1.DiskDevice{
+						CDRom: &v1.CDRomTarget{},
+					},
+				},
+			),
+		)
+		DescribeTable("Should validate insertable cdrom", func(volume v1.Volume, disks []v1.Disk, expectedErrMsgSubstring *string) {
+			err := validateInsertableCDRom(volume, disks)
+			if expectedErrMsgSubstring != nil {
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring(*expectedErrMsgSubstring))
+			} else {
+				Expect(err).ToNot(HaveOccurred())
+			}
+		},
+			Entry("valid insertion",
+				v1.Volume{
+					Name: "vol1",
+					VolumeSource: v1.VolumeSource{
+						EjectedCDRom: &v1.EjectedCDRomSource{},
+					},
+				},
+				[]v1.Disk{
+					{
+						Name: "vol1",
+						DiskDevice: v1.DiskDevice{
+							CDRom: &v1.CDRomTarget{},
+						},
+					},
+					{
+						Name: "vol2",
+						DiskDevice: v1.DiskDevice{
+							CDRom: &v1.CDRomTarget{},
+						},
+					},
+				},
+				nil,
+			),
+			Entry("volume not ejected cdrom",
+				v1.Volume{
+					Name: "vol1",
+					VolumeSource: v1.VolumeSource{
+						PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{},
+					},
+				},
+				[]v1.Disk{
+					{
+						Name: "vol1",
+						DiskDevice: v1.DiskDevice{
+							CDRom: &v1.CDRomTarget{},
+						},
+					},
+					{
+						Name: "vol2",
+						DiskDevice: v1.DiskDevice{
+							CDRom: &v1.CDRomTarget{},
+						},
+					},
+				},
+				pointer.StringPtr("the volume is not an ejected CDRom"),
+			),
+			Entry("no corresponding disk",
+				v1.Volume{
+					Name: "vol1",
+					VolumeSource: v1.VolumeSource{
+						EjectedCDRom: &v1.EjectedCDRomSource{},
+					},
+				},
+				[]v1.Disk{
+					{
+						Name: "vol3",
+						DiskDevice: v1.DiskDevice{
+							CDRom: &v1.CDRomTarget{},
+						},
+					},
+					{
+						Name: "vol2",
+						DiskDevice: v1.DiskDevice{
+							CDRom: &v1.CDRomTarget{},
+						},
+					},
+				},
+				pointer.StringPtr("no corresponding disk"),
+			),
+			Entry("disk is not cdrom",
+				v1.Volume{
+					Name: "vol1",
+					VolumeSource: v1.VolumeSource{
+						EjectedCDRom: &v1.EjectedCDRomSource{},
+					},
+				},
+				[]v1.Disk{
+					{
+						Name: "vol1",
+						DiskDevice: v1.DiskDevice{
+							Disk: &v1.DiskTarget{},
+						},
+					},
+					{
+						Name: "vol2",
+						DiskDevice: v1.DiskDevice{
+							CDRom: &v1.CDRomTarget{},
+						},
+					},
+				},
+				pointer.StringPtr("corresponding disk is not of type CDRom"),
+			),
+		)
+		DescribeTable("Should validate ejectable cdrom", func(volume v1.Volume, disks []v1.Disk, volumeStatus *v1.VolumeStatus, expectedErrMsgSubstring *string) {
+			err := validateEjectableCDRom(volume, disks, volumeStatus)
+			if expectedErrMsgSubstring != nil {
+				Expect(err).To(HaveOccurred())
+				Expect(err.Error()).To(ContainSubstring(*expectedErrMsgSubstring))
+			} else {
+				Expect(err).ToNot(HaveOccurred())
+			}
+		},
+			Entry("valid ejection",
+				v1.Volume{
+					Name: "vol1",
+					VolumeSource: v1.VolumeSource{
+						PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+							PersistentVolumeClaimVolumeSource: k8sv1.PersistentVolumeClaimVolumeSource{
+								ClaimName: "testpvcdiskclaim",
+							},
+							Hotpluggable: true,
+						},
+					},
+				},
+				[]v1.Disk{
+					{
+						Name: "vol1",
+						DiskDevice: v1.DiskDevice{
+							CDRom: &v1.CDRomTarget{},
+						},
+					},
+					{
+						Name: "vol2",
+						DiskDevice: v1.DiskDevice{
+							CDRom: &v1.CDRomTarget{},
+						},
+					},
+				},
+				nil,
+				nil,
+			),
+			Entry("already ejected",
+				v1.Volume{
+					Name: "vol1",
+					VolumeSource: v1.VolumeSource{
+						EjectedCDRom: &v1.EjectedCDRomSource{},
+					},
+				},
+				[]v1.Disk{
+					{
+						Name: "vol1",
+						DiskDevice: v1.DiskDevice{
+							CDRom: &v1.CDRomTarget{},
+						},
+					},
+					{
+						Name: "vol2",
+						DiskDevice: v1.DiskDevice{
+							CDRom: &v1.CDRomTarget{},
+						},
+					},
+				},
+				nil,
+				pointer.StringPtr("is already ejected"),
+			),
+			Entry("not hotpluggable",
+				v1.Volume{
+					Name: "vol1",
+					VolumeSource: v1.VolumeSource{
+						PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+							PersistentVolumeClaimVolumeSource: k8sv1.PersistentVolumeClaimVolumeSource{
+								ClaimName: "testpvcdiskclaim",
+							},
+							Hotpluggable: false,
+						},
+					},
+				},
+				[]v1.Disk{
+					{
+						Name: "vol1",
+						DiskDevice: v1.DiskDevice{
+							CDRom: &v1.CDRomTarget{},
+						},
+					},
+					{
+						Name: "vol2",
+						DiskDevice: v1.DiskDevice{
+							CDRom: &v1.CDRomTarget{},
+						},
+					},
+				},
+				nil,
+				pointer.StringPtr("is not hotpluggable"),
+			),
+			Entry("valid ejection - hotpluggable by status",
+				v1.Volume{
+					Name:         "vol1",
+					VolumeSource: v1.VolumeSource{},
+				},
+				[]v1.Disk{
+					{
+						Name: "vol1",
+						DiskDevice: v1.DiskDevice{
+							CDRom: &v1.CDRomTarget{},
+						},
+					},
+					{
+						Name: "vol2",
+						DiskDevice: v1.DiskDevice{
+							CDRom: &v1.CDRomTarget{},
+						},
+					},
+				},
+				&v1.VolumeStatus{
+					HotplugVolume: &v1.HotplugVolumeStatus{},
+				},
+				nil,
+			),
+			Entry("disk does not exist",
+				v1.Volume{
+					Name: "vol1",
+					VolumeSource: v1.VolumeSource{
+						PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+							PersistentVolumeClaimVolumeSource: k8sv1.PersistentVolumeClaimVolumeSource{
+								ClaimName: "testpvcdiskclaim",
+							},
+							Hotpluggable: true,
+						},
+					},
+				},
+				[]v1.Disk{
+					{
+						Name: "vol3",
+						DiskDevice: v1.DiskDevice{
+							CDRom: &v1.CDRomTarget{},
+						},
+					},
+					{
+						Name: "vol2",
+						DiskDevice: v1.DiskDevice{
+							CDRom: &v1.CDRomTarget{},
+						},
+					},
+				},
+				nil,
+				pointer.StringPtr("disk does not exist"),
+			),
+			Entry("matching disk is not a cdrom",
+				v1.Volume{
+					Name: "vol1",
+					VolumeSource: v1.VolumeSource{
+						PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+							PersistentVolumeClaimVolumeSource: k8sv1.PersistentVolumeClaimVolumeSource{
+								ClaimName: "testpvcdiskclaim",
+							},
+							Hotpluggable: true,
+						},
+					},
+				},
+				[]v1.Disk{
+					{
+						Name: "vol1",
+						DiskDevice: v1.DiskDevice{
+							Disk: &v1.DiskTarget{},
+						},
+					},
+					{
+						Name: "vol2",
+						DiskDevice: v1.DiskDevice{
+							CDRom: &v1.CDRomTarget{},
+						},
+					},
+				},
+				nil,
+				pointer.StringPtr("disk is not of type CDRom"),
+			),
 		)
 		DescribeTable("Should generate expected vm patch", func(volumeRequest *v1.VirtualMachineVolumeRequest, existingVolumeRequests []v1.VirtualMachineVolumeRequest, expectedPatch string, expectError bool) {
 
