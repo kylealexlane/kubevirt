@@ -16322,6 +16322,10 @@
      }
     }
    },
+   "v1.EjectedCDRomSource": {
+    "description": "EjectedCDRomSource represents an empty source for an ejected cdrom. EjectedCDRomSource is hotpluggable.",
+    "type": "object"
+   },
    "v1.EmptyDiskSource": {
     "description": "EmptyDisk represents a temporary disk which shares the vmis lifecycle.",
     "type": "object",
@@ -19820,6 +19824,10 @@
      "downwardMetrics": {
       "description": "DownwardMetrics adds a very small disk to VMIs which contains a limited view of host and guest metrics. The disk content is compatible with vhostmd (https://github.com/vhostmd/vhostmd) and vm-dump-metrics.",
       "$ref": "#/definitions/v1.DownwardMetricsVolumeSource"
+     },
+     "ejectedCDRom": {
+      "description": "EjectedCDRom represents an empty source for a CDRom which was previously ejected.",
+      "$ref": "#/definitions/v1.EjectedCDRomSource"
      },
      "emptyDisk": {
       "description": "EmptyDisk represents a temporary disk which shares the vmis lifecycle. More info: https://kubevirt.gitbooks.io/user-guide/disks-and-volumes.html",

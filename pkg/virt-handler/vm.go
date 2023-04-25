@@ -1,20 +1,20 @@
 /*
- * This file is part of the KubeVirt project
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- *
- * Copyright 2017 Red Hat, Inc.
- *
+* This file is part of the KubeVirt project
+*
+* Licensed under the Apache License, Version 2.0 (the "License");
+* you may not use this file except in compliance with the License.
+* You may obtain a copy of the License at
+*
+*     http://www.apache.org/licenses/LICENSE-2.0
+*
+* Unless required by applicable law or agreed to in writing, software
+* distributed under the License is distributed on an "AS IS" BASIS,
+* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+* See the License for the specific language governing permissions and
+* limitations under the License.
+*
+* Copyright 2017 Red Hat, Inc.
+*
  */
 
 package virthandler
@@ -870,14 +870,12 @@ func (d *VirtualMachineController) updateVolumeStatusesFromDomain(vmi *v1.Virtua
 	// used by unit test
 	hasHotplug := false
 
-	if domain == nil {
-		return hasHotplug
-	}
-
 	if len(vmi.Status.VolumeStatus) > 0 {
 		diskDeviceMap := make(map[string]string)
-		for _, disk := range domain.Spec.Devices.Disks {
-			diskDeviceMap[disk.Alias.GetName()] = disk.Target.Device
+		if domain != nil {
+			for _, disk := range domain.Spec.Devices.Disks {
+				diskDeviceMap[disk.Alias.GetName()] = disk.Target.Device
+			}
 		}
 		specVolumeMap := make(map[string]v1.Volume)
 		for _, volume := range vmi.Spec.Volumes {
@@ -896,9 +894,12 @@ func (d *VirtualMachineController) updateVolumeStatusesFromDomain(vmi *v1.Virtua
 				volumeStatus, tmpNeedsRefresh = d.updateHotplugVolumeStatus(vmi, volumeStatus, specVolumeMap)
 				needsRefresh = needsRefresh || tmpNeedsRefresh
 			}
-			if volumeStatus.MemoryDumpVolume != nil {
+			if volumeStatus.MemoryDumpVolume != nil && domain != nil {
 				volumeStatus, tmpNeedsRefresh = d.updateMemoryDumpInfo(vmi, volumeStatus, domain)
 				needsRefresh = needsRefresh || tmpNeedsRefresh
+			}
+			if (volumeStatus.Phase == v1.EjectedCDRom || volumeStatus.Phase == v1.EjectingCDRom) && domain != nil {
+				volumeStatus = d.updateEjectedCDRomInfo(vmi, volumeStatus, domain)
 			}
 			newStatuses = append(newStatuses, volumeStatus)
 			newStatusMap[volumeStatus.Name] = volumeStatus
@@ -1126,6 +1127,18 @@ func (d *VirtualMachineController) updateMemoryDumpInfo(vmi *v1.VirtualMachineIn
 	}
 
 	return volumeStatus, needsRefresh
+}
+
+func (d *VirtualMachineController) updateEjectedCDRomInfo(vmi *v1.VirtualMachineInstance, volumeStatus v1.VolumeStatus, domain *api.Domain) v1.VolumeStatus {
+	if volumeStatus.Phase == v1.EjectingCDRom {
+		for _, disk := range domain.Spec.Devices.Disks {
+			if disk.Target.Device == volumeStatus.Target && disk.Source.File == "" {
+				log.Log.Object(vmi).V(3).Infof("EjectedCDRom %s successfully ejected", volumeStatus.Name)
+				volumeStatus.Phase = v1.EjectedCDRom
+			}
+		}
+	}
+	return volumeStatus
 }
 
 func (d *VirtualMachineController) updateFSFreezeStatus(vmi *v1.VirtualMachineInstance, domain *api.Domain) {

@@ -199,24 +199,23 @@ func ApplyVolumeRequestOnVMISpec(vmiSpec *v1.VirtualMachineInstanceSpec, request
 			}
 		}
 
-		if !alreadyAdded {
-			newVolume := v1.Volume{
-				Name: request.AddVolumeOptions.Name,
-			}
+		isInsertCDRomRequest := IsInsertCDRomRequest(request)
+		if (!alreadyAdded && !isInsertCDRomRequest) || (alreadyAdded && isInsertCDRomRequest) {
+			newVolume := getNewVolumeFromRequest(request)
 
-			if request.AddVolumeOptions.VolumeSource.PersistentVolumeClaim != nil {
-				pvcSource := request.AddVolumeOptions.VolumeSource.PersistentVolumeClaim.DeepCopy()
-				pvcSource.Hotpluggable = true
-				newVolume.VolumeSource.PersistentVolumeClaim = pvcSource
-			} else if request.AddVolumeOptions.VolumeSource.DataVolume != nil {
-				dvSource := request.AddVolumeOptions.VolumeSource.DataVolume.DeepCopy()
-				dvSource.Hotpluggable = true
-				newVolume.VolumeSource.DataVolume = dvSource
+			if isInsertCDRomRequest {
+				replaceVolume(vmiSpec, newVolume)
+			} else {
+				vmiSpec.Volumes = append(vmiSpec.Volumes, newVolume)
 			}
-
-			vmiSpec.Volumes = append(vmiSpec.Volumes, newVolume)
 
 			if request.AddVolumeOptions.Disk != nil {
+				if isInsertCDRomRequest {
+					// if isInsertCDRomRequest, then Disk == nil, so no need to worry about
+					// replacing instead of appending here. Added extra error log in case
+					// this occurs.
+					log.Log.Errorf("encountered request to insert a cdrom with disk %s, but the disk cannot be specified when inserting cdroms", request.AddVolumeOptions.Disk.Name)
+				}
 				newDisk := request.AddVolumeOptions.Disk.DeepCopy()
 				newDisk.Name = request.AddVolumeOptions.Name
 
@@ -228,15 +227,29 @@ func ApplyVolumeRequestOnVMISpec(vmiSpec *v1.VirtualMachineInstanceSpec, request
 
 		newVolumesList := []v1.Volume{}
 		newDisksList := []v1.Disk{}
+		isEjectCDRomRequest := IsEjectCDRomRequest(request, vmiSpec.Domain.Devices.Disks)
 
 		for _, volume := range vmiSpec.Volumes {
 			if volume.Name != request.RemoveVolumeOptions.Name {
 				newVolumesList = append(newVolumesList, volume)
+			} else if isEjectCDRomRequest {
+				newVolume := v1.Volume{
+					Name: volume.Name,
+					VolumeSource: v1.VolumeSource{
+						EjectedCDRom: &v1.EjectedCDRomSource{},
+					},
+				}
+				newVolumesList = append(newVolumesList, newVolume)
 			}
 		}
 
 		for _, disk := range vmiSpec.Domain.Devices.Disks {
-			if disk.Name != request.RemoveVolumeOptions.Name {
+			if isEjectCDRomRequest {
+				if disk.Name == request.RemoveVolumeOptions.Name {
+					disk.Serial = ""
+				}
+				newDisksList = append(newDisksList, disk)
+			} else if disk.Name != request.RemoveVolumeOptions.Name {
 				newDisksList = append(newDisksList, disk)
 			}
 		}
@@ -246,6 +259,62 @@ func ApplyVolumeRequestOnVMISpec(vmiSpec *v1.VirtualMachineInstanceSpec, request
 	}
 
 	return vmiSpec
+}
+
+func IsInsertCDRomRequest(request *v1.VirtualMachineVolumeRequest) bool {
+	if request.AddVolumeOptions != nil && request.AddVolumeOptions.Disk == nil {
+		return true
+	}
+	return false
+}
+
+func IsEjectCDRomRequest(request *v1.VirtualMachineVolumeRequest, disks []v1.Disk) bool {
+	if request.RemoveVolumeOptions != nil {
+		for _, disk := range disks {
+			if disk.Name == request.RemoveVolumeOptions.Name {
+				if disk.CDRom != nil {
+					return true
+				} else {
+					// already found the one matching name, no need to continue
+					return false
+				}
+			}
+		}
+	}
+
+	return false
+}
+
+func getNewVolumeFromRequest(request *v1.VirtualMachineVolumeRequest) v1.Volume {
+	newVolume := v1.Volume{
+		Name: request.AddVolumeOptions.Name,
+	}
+
+	if request.AddVolumeOptions.VolumeSource.PersistentVolumeClaim != nil {
+		pvcSource := request.AddVolumeOptions.VolumeSource.PersistentVolumeClaim.DeepCopy()
+		pvcSource.Hotpluggable = true
+		newVolume.VolumeSource.PersistentVolumeClaim = pvcSource
+	} else if request.AddVolumeOptions.VolumeSource.DataVolume != nil {
+		dvSource := request.AddVolumeOptions.VolumeSource.DataVolume.DeepCopy()
+		dvSource.Hotpluggable = true
+		newVolume.VolumeSource.DataVolume = dvSource
+	}
+
+	return newVolume
+}
+
+func replaceVolume(vmiSpec *v1.VirtualMachineInstanceSpec, newVolume v1.Volume) {
+	newVolumesList := []v1.Volume{}
+
+	for _, volume := range vmiSpec.Volumes {
+		if volume.Name != newVolume.Name {
+			newVolumesList = append(newVolumesList, volume)
+		} else {
+			newVolumesList = append(newVolumesList, newVolume)
+		}
+	}
+
+	vmiSpec.Volumes = newVolumesList
 }
 
 func CurrentVMIPod(vmi *v1.VirtualMachineInstance, podInformer cache.SharedIndexInformer) (*k8sv1.Pod, error) {
@@ -348,6 +417,10 @@ func SetVMIMigrationPhaseTransitionTimestamp(oldVMIMigration *v1.VirtualMachineI
 	}
 }
 
+// VMIHasHotplugVolumes will return a boolean indicating whether the vmi has
+// volumes which are attached through a seperate attachment pod. Note that this
+// is seperate from all volumes which are hotpluggable to the vmi from the user
+// perspective.
 func VMIHasHotplugVolumes(vmi *v1.VirtualMachineInstance) bool {
 	for _, volumeStatus := range vmi.Status.VolumeStatus {
 		if volumeStatus.HotplugVolume != nil {
@@ -362,6 +435,43 @@ func VMIHasHotplugVolumes(vmi *v1.VirtualMachineInstance) bool {
 			return true
 		}
 	}
+	return false
+}
+
+// GetVolumeStatus will return the volume status corresponding to the name.
+// Will return nil if the VolumeStatus is not found.
+func GetVolumeStatus(vmi *v1.VirtualMachineInstance, name string) *v1.VolumeStatus {
+	for _, volumeStatus := range vmi.Status.VolumeStatus {
+		if volumeStatus.Name == name {
+			return &volumeStatus
+		}
+	}
+	return nil
+}
+
+// IsHotpluggableVolume will return a boolean indicating if the volume can be
+// hotplugged. It will check the volume for a Hotpluggable boolean as well as the
+// status for HotplugVolume. This indicates whether the volume can be added to
+// the vmi on the fly, and not necessarily if the volume is attached through a
+// seperate attachment pod.
+// Will ignore status if nil.
+func IsHotpluggableVolume(volume v1.Volume, volumeStatus *v1.VolumeStatus) bool {
+	if volume.DataVolume != nil && volume.DataVolume.Hotpluggable {
+		return true
+	}
+	if volume.PersistentVolumeClaim != nil && volume.PersistentVolumeClaim.Hotpluggable {
+		return true
+	}
+	if volume.EjectedCDRom != nil {
+		return true
+	}
+	if volume.MemoryDump != nil && volume.MemoryDump.Hotpluggable {
+		return true
+	}
+	if volumeStatus != nil && volumeStatus.HotplugVolume != nil {
+		return true
+	}
+
 	return false
 }
 

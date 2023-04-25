@@ -764,6 +764,10 @@ type VolumeSource struct {
 	DownwardMetrics *DownwardMetricsVolumeSource `json:"downwardMetrics,omitempty"`
 	// MemoryDump is attached to the virt launcher and is populated with a memory dump of the vmi
 	MemoryDump *MemoryDumpVolumeSource `json:"memoryDump,omitempty"`
+	// EjectedCDRom represents an empty source for a CDRom which was previously
+	// ejected.
+	// +optional
+	EjectedCDRom *EjectedCDRomSource `json:"ejectedCDRom,omitempty"`
 }
 
 // HotplugVolumeSource Represents the source of a volume to mount which are capable
@@ -820,6 +824,10 @@ type EmptyDiskSource struct {
 	// Capacity of the sparse disk.
 	Capacity resource.Quantity `json:"capacity"`
 }
+
+// EjectedCDRomSource represents an empty source for an ejected cdrom.
+// EjectedCDRomSource is hotpluggable.
+type EjectedCDRomSource struct{}
 
 // Represents a docker image with an embedded disk.
 type ContainerDiskSource struct {

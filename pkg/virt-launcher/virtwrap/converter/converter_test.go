@@ -3163,6 +3163,21 @@ var _ = Describe("Converter", func() {
 			Entry("block mode DV", Convert_v1_Hotplug_DataVolume_To_api_Disk, "test-block-dv", true, false),
 			Entry("'discard ignore' DV", Convert_v1_Hotplug_DataVolume_To_api_Disk, "test-discard-ignore", false, true),
 		)
+		It("should convert ejected cdrom", func() {
+			expectedDisk := &api.Disk{}
+			expectedDisk.Driver = &api.DiskDriver{}
+			expectedDisk.Source.File = ""
+			expectedDisk.Type = "file"
+			expectedDisk.Driver.Type = "raw"
+			expectedDisk.Device = "cdrom"
+
+			disk := &api.Disk{
+				Driver: &api.DiskDriver{},
+				Device: "cdrom",
+			}
+			Expect(Convert_v1_EjectedCDRom_To_api_Disk(disk)).To(Succeed())
+			Expect(disk).To(Equal(expectedDisk))
+		})
 	})
 
 	Context("with AMD SEV LaunchSecurity", func() {
@@ -3453,7 +3468,12 @@ var _ = Describe("SetDriverCacheMode", func() {
 		mockDirectIOChecker.EXPECT().CheckFile(gomock.Any()).AnyTimes().Return(false, checkerError)
 	}
 
-	DescribeTable("should correctly set driver cache mode", func(cache, expectedCache string, setExpectations func()) {
+	expectNoCheck := func() {
+		mockDirectIOChecker.EXPECT().CheckBlockDevice(gomock.Any()).Times(0)
+		mockDirectIOChecker.EXPECT().CheckFile(gomock.Any()).Times(0)
+	}
+
+	DescribeTable("should correctly set driver cache mode", func(cache, expectedCache string, setExpectations func(), isEjectedCDRom bool) {
 		disk := &api.Disk{
 			Driver: &api.DiskDriver{
 				Cache: cache,
@@ -3462,6 +3482,11 @@ var _ = Describe("SetDriverCacheMode", func() {
 				File: "file",
 			},
 		}
+		if isEjectedCDRom {
+			disk.Source.File = ""
+			disk.Device = "cdrom"
+		}
+
 		setExpectations()
 		err := SetDriverCacheMode(disk, mockDirectIOChecker)
 		if expectedCache == "" {
@@ -3471,15 +3496,16 @@ var _ = Describe("SetDriverCacheMode", func() {
 			Expect(disk.Driver.Cache).To(Equal(expectedCache))
 		}
 	},
-		Entry("detect 'none' with direct io", string(""), string(v1.CacheNone), expectCheckTrue),
-		Entry("detect 'writethrough' without direct io", string(""), string(v1.CacheWriteThrough), expectCheckFalse),
-		Entry("fallback to 'writethrough' on error", string(""), string(v1.CacheWriteThrough), expectCheckError),
-		Entry("keep 'none' with direct io", string(v1.CacheNone), string(v1.CacheNone), expectCheckTrue),
-		Entry("return error without direct io", string(v1.CacheNone), string(""), expectCheckFalse),
-		Entry("return error on error", string(v1.CacheNone), string(""), expectCheckError),
-		Entry("'writethrough' with direct io", string(v1.CacheWriteThrough), string(v1.CacheWriteThrough), expectCheckTrue),
-		Entry("'writethrough' without direct io", string(v1.CacheWriteThrough), string(v1.CacheWriteThrough), expectCheckFalse),
-		Entry("'writethrough' on error", string(v1.CacheWriteThrough), string(v1.CacheWriteThrough), expectCheckError),
+		Entry("detect 'none' with direct io", string(""), string(v1.CacheNone), expectCheckTrue, false),
+		Entry("detect 'writethrough' without direct io", string(""), string(v1.CacheWriteThrough), expectCheckFalse, false),
+		Entry("fallback to 'writethrough' on error", string(""), string(v1.CacheWriteThrough), expectCheckError, false),
+		Entry("keep 'none' with direct io", string(v1.CacheNone), string(v1.CacheNone), expectCheckTrue, false),
+		Entry("return error without direct io", string(v1.CacheNone), string(""), expectCheckFalse, false),
+		Entry("return error on error", string(v1.CacheNone), string(""), expectCheckError, false),
+		Entry("'writethrough' with direct io", string(v1.CacheWriteThrough), string(v1.CacheWriteThrough), expectCheckTrue, false),
+		Entry("'writethrough' without direct io", string(v1.CacheWriteThrough), string(v1.CacheWriteThrough), expectCheckFalse, false),
+		Entry("'writethrough' on error", string(v1.CacheWriteThrough), string(v1.CacheWriteThrough), expectCheckError, false),
+		Entry("keep same cache when using ejected cdrom", string(v1.CacheNone), string(v1.CacheNone), expectNoCheck, true),
 	)
 })
 

@@ -103,8 +103,8 @@ type ConverterContext struct {
 	CPUSet                []int
 	IsBlockPVC            map[string]bool
 	IsBlockDV             map[string]bool
-	HotplugVolumes        map[string]v1.VolumeStatus
-	PermanentVolumes      map[string]v1.VolumeStatus
+	HotplugVolumes        map[string]*v1.VolumeStatus
+	PermanentVolumes      map[string]*v1.VolumeStatus
 	DisksInfo             map[string]*cmdv1.DiskInfo
 	SMBios                *cmdv1.SMBios
 	SRIOVDevices          []api.HostDevice
@@ -422,6 +422,16 @@ func SetDriverCacheMode(disk *api.Disk, directIOChecker DirectIOChecker) error {
 	} else if disk.Source.Dev != "" {
 		path = disk.Source.Dev
 		isBlockDev = true
+	} else if disk.Device == "cdrom" {
+		// This is an ejected CDRom, so set the cache mode if not specified by user.
+		if mode == "" {
+			// Cache mode cannot be later changed by an inserted CDRom, so we use the
+			// cache mode which we anticipate inserted .iso images will use.
+			mode = v1.CacheNone
+			disk.Driver.Cache = string(mode)
+			log.Log.Infof("Driver cache mode for %s set to %s", path, mode)
+		}
+		return nil
 	} else {
 		return fmt.Errorf("Unable to set a driver cache mode, disk is neither a block device nor a file")
 	}
@@ -492,6 +502,12 @@ func SetOptimalIOMode(disk *api.Disk) error {
 		path = disk.Source.File
 	} else if disk.Source.Dev != "" {
 		path = disk.Source.Dev
+	} else if disk.Device == "cdrom" {
+		// This is an ejected CDRom, and driver io is not mutable later. Set IO to
+		// be most likely scenario for an attached iso later.
+		disk.Driver.IO = v1.IONative
+		log.Log.Infof("Driver IO mode for %s set to %s", path, disk.Driver.IO)
+		return nil
 	} else {
 		return nil
 	}
@@ -636,6 +652,9 @@ func Convert_v1_Volume_To_api_Disk(source *v1.Volume, disk *api.Disk, c *Convert
 	if source.DownwardMetrics != nil {
 		return Convert_v1_DownwardMetricSource_To_api_Disk(disk, c)
 	}
+	if source.EjectedCDRom != nil {
+		return Convert_v1_EjectedCDRom_To_api_Disk(disk)
+	}
 
 	return fmt.Errorf("disk %s references an unsupported source", disk.Alias.GetName())
 }
@@ -655,6 +674,11 @@ func Convert_v1_Hotplug_Volume_To_api_Disk(source *v1.Volume, disk *api.Disk, c 
 	if source.DataVolume != nil {
 		return Convert_v1_Hotplug_DataVolume_To_api_Disk(source.Name, disk, c)
 	}
+
+	if source.EjectedCDRom != nil {
+		return Convert_v1_EjectedCDRom_To_api_Disk(disk)
+	}
+
 	return fmt.Errorf("hotplug disk %s references an unsupported source", disk.Alias.GetName())
 }
 
@@ -830,6 +854,17 @@ func Convert_v1_DownwardMetricSource_To_api_Disk(disk *api.Disk, c *ConverterCon
 	disk.Source = api.DiskSource{
 		File: config.DownwardMetricDisk,
 	}
+	return nil
+}
+
+func Convert_v1_EjectedCDRom_To_api_Disk(disk *api.Disk) error {
+	if disk.Device != "cdrom" {
+		return fmt.Errorf("device %s is not cdrom. Device must be cdrom if volume is of type EjectedCDRom", disk.Alias.GetName())
+	}
+	disk.Source.File = ""
+	disk.Type = "file"
+	disk.Driver.Type = "raw"
+
 	return nil
 }
 
@@ -1545,7 +1580,7 @@ func Convert_v1_VirtualMachineInstance_To_api_Domain(vmi *v1.VirtualMachineInsta
 
 		hpStatus, hpOk := c.HotplugVolumes[disk.Name]
 		// if len(c.PermanentVolumes) == 0, it means the vmi is not ready yet, add all disks
-		if _, ok := c.PermanentVolumes[disk.Name]; ok || len(c.PermanentVolumes) == 0 || (hpOk && (hpStatus.Phase == v1.HotplugVolumeMounted || hpStatus.Phase == v1.VolumeReady)) {
+		if _, ok := c.PermanentVolumes[disk.Name]; ok || len(c.PermanentVolumes) == 0 || (hpOk && (hpStatus != nil && hpStatus.Phase == v1.HotplugVolumeMounted || hpStatus.Phase == v1.VolumeReady)) || (volume.EjectedCDRom != nil && hpOk) {
 			domain.Spec.Devices.Disks = append(domain.Spec.Devices.Disks, newDisk)
 		}
 	}
@@ -1922,10 +1957,15 @@ func newDeviceNamer(volumeStatuses []v1.VolumeStatus, disks []v1.Disk) map[strin
 	}
 
 	for _, disk := range disks {
-		if disk.Disk == nil {
+		var prefix string
+		if disk.Disk != nil {
+			prefix = getPrefixFromBus(disk.Disk.Bus)
+		} else if disk.CDRom != nil {
+			prefix = getPrefixFromBus(disk.CDRom.Bus)
+		} else {
 			continue
 		}
-		prefix := getPrefixFromBus(disk.Disk.Bus)
+
 		if _, ok := prefixMap[prefix]; !ok {
 			prefixMap[prefix] = deviceNamer{
 				existingNameMap: make(map[string]string),

@@ -1662,6 +1662,42 @@ var _ = Describe("VirtualMachineInstance", func() {
 
 		})
 
+		Context("ejected cdrom status events", func() {
+			It("Should update ejected cdrom status when domain is updated", func() {
+				vmi := api2.NewMinimalVMI("testvmi")
+				vmi.UID = vmiTestUUID
+				vmi.Status.Phase = v1.Running
+				vmi.Spec.Volumes = append(vmi.Spec.Volumes, v1.Volume{
+					Name: "test",
+				})
+				volumeStatus := v1.VolumeStatus{
+					Name:   "test",
+					Phase:  v1.EjectingCDRom,
+					Target: "abc",
+				}
+				vmi.Status.VolumeStatus = append(vmi.Status.VolumeStatus, volumeStatus)
+				domain := api.NewMinimalDomainWithUUID("testvmi", vmiTestUUID)
+				domain.Status.Status = api.Running
+				ejectedCDRomDisk := api.Disk{
+					Alias: api.NewUserDefinedAlias("test"),
+					Target: api.DiskTarget{
+						Device: "abc",
+					},
+					Source: api.DiskSource{
+						File: "",
+					},
+				}
+				domain.Spec.Devices.Disks = append(domain.Spec.Devices.Disks, ejectedCDRomDisk)
+				vmiFeeder.Add(vmi)
+				domainFeeder.Add(domain)
+
+				hasHotplug := controller.updateVolumeStatusesFromDomain(vmi, domain)
+				Expect(hasHotplug).To(BeFalse())
+				Expect(vmi.Status.VolumeStatus[0].Phase).To(Equal(v1.EjectedCDRom))
+				testutils.ExpectEvent(recorder, "")
+			})
+		})
+
 		DescribeTable("should leave the VirtualMachineInstance alone if it is in the final phase", func(phase v1.VirtualMachineInstancePhase) {
 			vmi := api2.NewMinimalVMI("testvmi")
 			vmi.Status.Phase = phase

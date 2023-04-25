@@ -1,20 +1,20 @@
 /*
- * This file is part of the KubeVirt project
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *     http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License.
- *
- * Copyright 2018 Red Hat, Inc.
- *
+* This file is part of the KubeVirt project
+*
+* Licensed under the Apache License, Version 2.0 (the "License");
+* you may not use this file except in compliance with the License.
+* You may obtain a copy of the License at
+*
+*     http://www.apache.org/licenses/LICENSE-2.0
+*
+* Unless required by applicable law or agreed to in writing, software
+* distributed under the License is distributed on an "AS IS" BASIS,
+* WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+* See the License for the specific language governing permissions and
+* limitations under the License.
+*
+* Copyright 2018 Red Hat, Inc.
+*
  */
 
 package admitters
@@ -27,6 +27,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	k8sfield "k8s.io/apimachinery/pkg/util/validation/field"
 
+	"kubevirt.io/kubevirt/pkg/controller"
 	"kubevirt.io/kubevirt/pkg/virt-api/webhooks"
 	virtconfig "kubevirt.io/kubevirt/pkg/virt-config"
 
@@ -125,8 +126,27 @@ func admitHotplug(newVolumes, oldVolumes []v1.Volume, newDisks, oldDisks []v1.Di
 }
 
 func verifyHotplugVolumes(newHotplugVolumeMap, oldHotplugVolumeMap map[string]v1.Volume, newDisks, oldDisks map[string]v1.Disk) *admissionv1.AdmissionResponse {
+	newEjectedCDRoms := getEjectedCDRoms(newHotplugVolumeMap, newDisks)
+	newInsertedCDRoms := getInsertedCDRoms(newHotplugVolumeMap, newDisks)
+	oldEjectedCDRoms := getEjectedCDRoms(oldHotplugVolumeMap, oldDisks)
+	oldInsertedCDRoms := getInsertedCDRoms(oldHotplugVolumeMap, oldDisks)
+
+	// Since we previously filtered only hotplugged volumes for the maps, and then
+	// filtered inserted or ejected CDRoms, then newly inserted / ejected maps
+	// are verified.
+	newlyEjectedCDRomsMap := getOverlap(newEjectedCDRoms, oldInsertedCDRoms)
+	newlyInsertedCDRomsMap := getOverlap(oldEjectedCDRoms, newInsertedCDRoms)
+
 	for k, v := range newHotplugVolumeMap {
 		if _, ok := oldHotplugVolumeMap[k]; ok {
+			// We already verified the special cases when hotplugged volumes are being
+			// ejected or inserted (from previosly inserted or ejected hotplugged volumes)
+			_, isNewlyInserted := newlyInsertedCDRomsMap[k]
+			_, isNewlyEjected := newlyEjectedCDRomsMap[k]
+			if isNewlyEjected || isNewlyInserted {
+				continue
+			}
+
 			// New and old have same volume, ensure they are the same
 			if !equality.Semantic.DeepEqual(v, oldHotplugVolumeMap[k]) {
 				return webhookutils.ToAdmissionResponse([]metav1.StatusCause{
@@ -174,7 +194,19 @@ func verifyHotplugVolumes(newHotplugVolumeMap, oldHotplugVolumeMap map[string]v1
 						},
 					})
 				}
+
 				disk := newDisks[k]
+				// CDRoms are a special case and cannot be hotplugged on the fly.
+				// Libvirt does not allow hotplugging CDRoms, so hotpluggable CDRoms
+				// must only be defined during vmi creation.
+				if disk.CDRom != nil {
+					return webhookutils.ToAdmissionResponse([]metav1.StatusCause{
+						{
+							Type:    metav1.CauseTypeFieldValueInvalid,
+							Message: fmt.Sprintf("new hotplugged Disk %s cannot have type cdrom", k),
+						},
+					})
+				}
 				if disk.Disk == nil || disk.Disk.Bus != "scsi" {
 					return webhookutils.ToAdmissionResponse([]metav1.StatusCause{
 						{
@@ -242,36 +274,94 @@ func getDiskMap(disks []v1.Disk) map[string]v1.Disk {
 	return newDiskMap
 }
 
-func getHotplugVolumes(volumes []v1.Volume, volumeStatuses []v1.VolumeStatus) map[string]v1.Volume {
-	permanentVolumesFromStatus := make(map[string]v1.Volume, 0)
-	for _, volume := range volumeStatuses {
-		if volume.HotplugVolume == nil {
-			permanentVolumesFromStatus[volume.Name] = v1.Volume{}
+func getHotplugVolumes(volumes []v1.Volume, oldVolumeStatuses []v1.VolumeStatus) map[string]v1.Volume {
+	volumeStatusMap := make(map[string]v1.VolumeStatus, 0)
+	for _, volumeStatus := range oldVolumeStatuses {
+		volumeStatusMap[volumeStatus.Name] = volumeStatus
+	}
+
+	hotplugVolumes := make(map[string]v1.Volume, 0)
+	for _, volume := range volumes {
+		if oldVolumeStatus, ok := volumeStatusMap[volume.Name]; ok {
+			// Use old code logic and utilize old volume status to check if it is
+			// hotpluggable
+			if controller.IsHotpluggableVolume(volume, &oldVolumeStatus) {
+				hotplugVolumes[volume.Name] = volume
+			}
+		} else {
+			// Follow old code logic and if any volume is not present in the old
+			// status map, then consider it a hotplug volume.
+			hotplugVolumes[volume.Name] = volume
 		}
 	}
+	return hotplugVolumes
+}
+
+func getPermanentVolumes(volumes []v1.Volume, oldVolumeStatuses []v1.VolumeStatus) map[string]v1.Volume {
+	volumeStatusMap := make(map[string]v1.VolumeStatus, 0)
+	for _, volumeStatus := range oldVolumeStatuses {
+		volumeStatusMap[volumeStatus.Name] = volumeStatus
+	}
+
 	permanentVolumes := make(map[string]v1.Volume, 0)
 	for _, volume := range volumes {
-		if _, ok := permanentVolumesFromStatus[volume.Name]; !ok {
-			permanentVolumes[volume.Name] = volume
+		// Only consider volumes that existed in the old status map as permanent.
+		if oldVolumeStatus, ok := volumeStatusMap[volume.Name]; ok {
+			// Use old code logic and utilize old volume status to check if it is
+			// hotpluggable
+			if !controller.IsHotpluggableVolume(volume, &oldVolumeStatus) {
+				permanentVolumes[volume.Name] = volume
+			}
 		}
 	}
 	return permanentVolumes
 }
 
-func getPermanentVolumes(volumes []v1.Volume, volumeStatuses []v1.VolumeStatus) map[string]v1.Volume {
-	permanentVolumesFromStatus := make(map[string]v1.Volume, 0)
-	for _, volume := range volumeStatuses {
-		if volume.HotplugVolume == nil {
-			permanentVolumesFromStatus[volume.Name] = v1.Volume{}
+func getEjectedCDRoms(volumes map[string]v1.Volume, disks map[string]v1.Disk) map[string]v1.Volume {
+	cdromDisks := make(map[string]v1.Disk, 0)
+	for _, disk := range disks {
+		if disk.CDRom != nil && disk.Name != "" {
+			cdromDisks[disk.Name] = v1.Disk{}
 		}
 	}
-	permanentVolumes := make(map[string]v1.Volume, 0)
+	ejectedCDRoms := make(map[string]v1.Volume, 0)
 	for _, volume := range volumes {
-		if _, ok := permanentVolumesFromStatus[volume.Name]; ok {
-			permanentVolumes[volume.Name] = volume
+		if volume.EjectedCDRom != nil {
+			if _, ok := cdromDisks[volume.Name]; ok {
+				ejectedCDRoms[volume.Name] = volume
+			}
 		}
 	}
-	return permanentVolumes
+	return ejectedCDRoms
+}
+
+func getInsertedCDRoms(volumes map[string]v1.Volume, disks map[string]v1.Disk) map[string]v1.Volume {
+	cdromDisks := make(map[string]v1.Disk, 0)
+	for _, disk := range disks {
+		if disk.CDRom != nil && disk.Name != "" {
+			cdromDisks[disk.Name] = v1.Disk{}
+		}
+	}
+	insertedCDRoms := make(map[string]v1.Volume, 0)
+	for _, volume := range volumes {
+		if volume.EjectedCDRom == nil && (volume.DataVolume != nil || volume.PersistentVolumeClaim != nil) {
+			if _, ok := cdromDisks[volume.Name]; ok {
+				insertedCDRoms[volume.Name] = volume
+			}
+		}
+	}
+	return insertedCDRoms
+}
+
+func getOverlap(volumes1, volumes2 map[string]v1.Volume) map[string]v1.Volume {
+	overlappedVolumes := make(map[string]v1.Volume)
+	for k, vol1 := range volumes1 {
+		if _, ok := volumes2[k]; ok {
+			overlappedVolumes[k] = vol1
+		}
+	}
+
+	return overlappedVolumes
 }
 
 func admitVMILabelsUpdate(

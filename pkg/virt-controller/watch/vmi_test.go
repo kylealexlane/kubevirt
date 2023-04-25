@@ -101,6 +101,10 @@ var _ = Describe("VirtualMachineInstance watcher", func() {
 	var qemuGid int64 = 107
 	controllerOf := true
 
+	asStrPtr := func(s string) *string {
+		return &s
+	}
+
 	shouldExpectMatchingPodCreation := func(uid types.UID, matchers ...gomegaTypes.GomegaMatcher) {
 		// Expect pod creation
 		kubeClient.Fake.PrependReactor("create", "pods", func(action testing.Action) (handled bool, obj k8sruntime.Object, err error) {
@@ -2371,6 +2375,37 @@ var _ = Describe("VirtualMachineInstance watcher", func() {
 			return res
 		}
 
+		makeEjectedCDRomVolumes := func(total int, indexes ...int) []*virtv1.Volume {
+			res := make([]*virtv1.Volume, 0)
+			for i := 0; i < total; i++ {
+				ejectedCDRom := false
+				for _, index := range indexes {
+					if i == index {
+						ejectedCDRom = true
+						res = append(res, &virtv1.Volume{
+							Name: fmt.Sprintf("volume%d", index),
+							VolumeSource: virtv1.VolumeSource{
+								EjectedCDRom: &v1.EjectedCDRomSource{},
+							},
+						})
+					}
+				}
+				if !ejectedCDRom {
+					res = append(res, &virtv1.Volume{
+						Name: fmt.Sprintf("volume%d", i),
+						VolumeSource: virtv1.VolumeSource{
+							PersistentVolumeClaim: &virtv1.PersistentVolumeClaimVolumeSource{
+								PersistentVolumeClaimVolumeSource: k8sv1.PersistentVolumeClaimVolumeSource{
+									ClaimName: fmt.Sprintf("claim%d", i),
+								},
+							},
+						},
+					})
+				}
+			}
+			return res
+		}
+
 		makeK8sVolumes := func(indexes ...int) []k8sv1.Volume {
 			res := make([]k8sv1.Volume, 0)
 			for _, index := range indexes {
@@ -2557,14 +2592,14 @@ var _ = Describe("VirtualMachineInstance watcher", func() {
 			Entry("should return number (2) of pods passed in", 2),
 		)
 
-		DescribeTable("getHotplugVolumes", func(virtlauncherVolumes []k8sv1.Volume, vmiVolumes []*virtv1.Volume, expectedIndexes ...int) {
+		DescribeTable("getHotplugVolumes", func(virtlauncherVolumes []k8sv1.Volume, vmiVolumes []*virtv1.Volume, includeEjectedCDRoms bool, expectedIndexes ...int) {
 			vmi := NewPendingVirtualMachine("testvmi")
 			for _, volume := range vmiVolumes {
 				vmi.Spec.Volumes = append(vmi.Spec.Volumes, *volume)
 			}
 			virtlauncherPod := NewPodForVirtualMachine(vmi, k8sv1.PodRunning)
 			virtlauncherPod.Spec.Volumes = virtlauncherVolumes
-			res := getHotplugVolumes(vmi, virtlauncherPod)
+			res := getHotplugVolumes(vmi, virtlauncherPod, includeEjectedCDRoms)
 			Expect(res).To(HaveLen(len(expectedIndexes)))
 			for _, index := range expectedIndexes {
 				found := false
@@ -2576,11 +2611,13 @@ var _ = Describe("VirtualMachineInstance watcher", func() {
 				Expect(found).To(BeTrue())
 			}
 		},
-			Entry("should return no volumes if vmi and virtlauncher have no volumes", makeK8sVolumes(), makeVolumes()),
-			Entry("should return a volume if vmi has one more than virtlauncher", makeK8sVolumes(), makeVolumes(1), 1),
-			Entry("should return a volume if vmi has one more than virtlauncher, with matching volumes", makeK8sVolumes(1, 3), makeVolumes(1, 2, 3), 2),
-			Entry("should return multiple volumes if vmi has multiple more than virtlauncher, with matching volumes", makeK8sVolumes(1, 3), makeVolumes(1, 2, 3, 4, 5), 2, 4, 5),
-			Entry("should return a memory dump volume if vmi has memory dump volume not on virtlauncher", makeK8sVolumes(0, 2), makeVolumesWithMemoryDump(3, 1), 1),
+			Entry("should return no volumes if vmi and virtlauncher have no volumes", makeK8sVolumes(), makeVolumes(), false),
+			Entry("should return a volume if vmi has one more than virtlauncher", makeK8sVolumes(), makeVolumes(1), false, 1),
+			Entry("should return a volume if vmi has one more than virtlauncher, with matching volumes", makeK8sVolumes(1, 3), makeVolumes(1, 2, 3), false, 2),
+			Entry("should return multiple volumes if vmi has multiple more than virtlauncher, with matching volumes", makeK8sVolumes(1, 3), makeVolumes(1, 2, 3, 4, 5), false, 2, 4, 5),
+			Entry("should return a memory dump volume if vmi has memory dump volume not on virtlauncher", makeK8sVolumes(0, 2), makeVolumesWithMemoryDump(3, 1), false, 1),
+			Entry("should consider ejected cdroms with flag", makeK8sVolumes(0, 2), makeEjectedCDRomVolumes(3, 1), true, 1),
+			Entry("should ignore ejected cdroms without flag", makeK8sVolumes(0, 2), makeEjectedCDRomVolumes(3, 1), false),
 		)
 
 		truncateSprintf := func(str string, args ...interface{}) string {
@@ -2624,7 +2661,15 @@ var _ = Describe("VirtualMachineInstance watcher", func() {
 			return makeVolumeStatusesForUpdateWithMessage("test-pod", "abcd", virtv1.HotplugVolumeAttachedToNode, "Created hotplug attachment pod test-pod, for volume volume%d", SuccessfulCreatePodReason, indexes...)
 		}
 
-		DescribeTable("updateVolumeStatus", func(oldStatus []virtv1.VolumeStatus, specVolumes []*virtv1.Volume, podIndexes []int, pvcIndexes []int, expectedStatus []virtv1.VolumeStatus, expectedEvents []string) {
+		makeVolumeStatusesForUpdateWithTarget := func(indexes ...int) []virtv1.VolumeStatus {
+			res := makeVolumeStatusesForUpdateWithMessage("test-pod", "abcd", virtv1.HotplugVolumeAttachedToNode, "Created hotplug attachment pod test-pod, for volume volume%d", SuccessfulCreatePodReason, indexes...)
+			for i, _ := range res {
+				res[i].Target = "abc"
+			}
+			return res
+		}
+
+		DescribeTable("updateVolumeStatus", func(oldStatus []virtv1.VolumeStatus, specVolumes []*virtv1.Volume, podIndexes []int, pvcIndexes []int, expectedStatus []virtv1.VolumeStatus, expectedEvents []string, expectedErrorMsg *string) {
 			vmi := NewPendingVirtualMachine("testvmi")
 			volumes := make([]virtv1.Volume, 0)
 			for _, volume := range specVolumes {
@@ -2646,7 +2691,11 @@ var _ = Describe("VirtualMachineInstance watcher", func() {
 
 			err := controller.updateVolumeStatus(vmi, virtlauncherPod)
 			testutils.ExpectEvents(recorder, expectedEvents...)
-			Expect(err).ToNot(HaveOccurred())
+			if expectedErrorMsg != nil {
+				Expect(err.Error()).To(ContainSubstring(*expectedErrorMsg))
+			} else {
+				Expect(err).ToNot(HaveOccurred())
+			}
 			Expect(equality.Semantic.DeepEqual(expectedStatus, vmi.Status.VolumeStatus)).To(BeTrue(), "status: %v, expected: %v", vmi.Status.VolumeStatus, expectedStatus)
 		},
 			Entry("should not update volume status, if no volumes changed",
@@ -2655,49 +2704,91 @@ var _ = Describe("VirtualMachineInstance watcher", func() {
 				[]int{},
 				[]int{},
 				makeVolumeStatusesForUpdate(),
-				[]string{}),
+				[]string{},
+				nil),
 			Entry("should update volume status, if a new volume is added, and pod exists",
 				makeVolumeStatusesForUpdate(),
 				makeVolumes(0),
 				[]int{0},
 				[]int{0},
 				makeVolumeStatusesForUpdate(0),
-				[]string{SuccessfulCreatePodReason}),
+				[]string{SuccessfulCreatePodReason},
+				nil),
 			Entry("should update volume status, if a new volume is added, and pod does not exist",
 				makeVolumeStatusesForUpdate(),
 				makeVolumes(0),
 				[]int{},
 				[]int{0},
 				makeVolumeStatusesForUpdateWithMessage("", "", virtv1.VolumeBound, "PVC is in phase Bound", PVCNotReadyReason, 0),
-				[]string{}),
+				[]string{},
+				nil),
 			Entry("should update volume status, if a existing volume is changed, and pod does not exist",
 				makeVolumeStatusesForUpdateWithMessage("", "", virtv1.VolumePending, "PVC is in phase Pending", PVCNotReadyReason, 0),
 				makeVolumes(0),
 				[]int{},
 				[]int{0},
 				makeVolumeStatusesForUpdateWithMessage("", "", virtv1.VolumeBound, "PVC is in phase Bound", PVCNotReadyReason, 0),
-				[]string{}),
+				[]string{},
+				nil),
 			Entry("should keep status, if volume removed and if pod still exists",
 				makeVolumeStatusesForUpdate(0),
 				makeVolumes(),
 				[]int{0},
 				[]int{0},
 				makeVolumeStatusesForUpdateWithMessage("test-pod", "abcd", virtv1.HotplugVolumeDetaching, "Deleted hotplug attachment pod test-pod, for volume volume0", SuccessfulDeletePodReason, 0),
-				[]string{SuccessfulDeletePodReason}),
+				[]string{SuccessfulDeletePodReason},
+				nil),
 			Entry("should remove volume status, if volume is removed and pod is gone",
 				makeVolumeStatusesForUpdate(0),
 				makeVolumes(),
 				[]int{},
 				[]int{},
 				makeVolumeStatusesForUpdate(),
-				[]string{}),
+				[]string{},
+				nil),
 			Entry("should update volume status with memory dump, if a new memory dump volume is added",
 				makeVolumeStatusesForUpdate(),
 				makeVolumesWithMemoryDump(1, 0),
 				[]int{0},
 				[]int{0},
 				makeVolumeStatusesForUpdateWithMemoryDump(0, 0),
-				[]string{SuccessfulCreatePodReason}),
+				[]string{SuccessfulCreatePodReason},
+				nil),
+			Entry("should update volume status ejectedCDRom, if a new ejected cdrom volume is added",
+				makeVolumeStatusesForUpdateWithTarget(0),
+				makeEjectedCDRomVolumes(1, 0),
+				[]int{},
+				[]int{},
+				[]virtv1.VolumeStatus{
+					{
+						Name:   "volume0",
+						Target: "abc",
+						Phase:  virtv1.EjectingCDRom,
+					},
+				},
+				[]string{},
+				nil),
+			Entry("should not return an error if a new ejected cdrom volume is added but no previous volume existed",
+				makeVolumeStatusesForUpdate(),
+				makeEjectedCDRomVolumes(1, 0),
+				[]int{},
+				[]int{},
+				[]virtv1.VolumeStatus{
+					{
+						Name:  "volume0",
+						Phase: virtv1.EjectingCDRom,
+					},
+				},
+				[]string{},
+				nil),
+			Entry("should return an error if a new ejected cdrom volume is added but the previous volume did not have a target",
+				makeVolumeStatusesForUpdate(0),
+				makeEjectedCDRomVolumes(1, 0),
+				[]int{},
+				[]int{},
+				makeVolumeStatusesForUpdate(0),
+				[]string{},
+				asStrPtr("is ejected CDRom type, but there was no target for previously attached volume in volumeStatus")),
 		)
 
 		It("Should get default filesystem overhead if there are multiple CDI instances", func() {

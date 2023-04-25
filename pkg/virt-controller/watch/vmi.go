@@ -1228,7 +1228,7 @@ func (c *VMIController) sync(vmi *virtv1.VirtualMachineInstance, pod *k8sv1.Pod,
 			*pod = *patchedPod
 		}
 
-		hotplugVolumes := getHotplugVolumes(vmi, pod)
+		hotplugVolumes := getHotplugVolumes(vmi, pod, false)
 		hotplugAttachmentPods, err := controller.AttachmentPods(pod, c.podInformer)
 		if err != nil {
 			return &syncErrorImpl{fmt.Errorf("failed to get attachment pods: %v", err), FailedHotplugSyncReason}
@@ -1715,7 +1715,7 @@ func shouldSetMigrationTransport(pod *k8sv1.Pod) bool {
 	return ok
 }
 
-func getHotplugVolumes(vmi *virtv1.VirtualMachineInstance, virtlauncherPod *k8sv1.Pod) []*virtv1.Volume {
+func getHotplugVolumes(vmi *virtv1.VirtualMachineInstance, virtlauncherPod *k8sv1.Pod, includeEjectedCDRoms bool) []*virtv1.Volume {
 	hotplugVolumes := make([]*virtv1.Volume, 0)
 	podVolumes := virtlauncherPod.Spec.Volumes
 	vmiVolumes := vmi.Spec.Volumes
@@ -1725,7 +1725,7 @@ func getHotplugVolumes(vmi *virtv1.VirtualMachineInstance, virtlauncherPod *k8sv
 		podVolumeMap[podVolume.Name] = podVolume
 	}
 	for _, vmiVolume := range vmiVolumes {
-		if _, ok := podVolumeMap[vmiVolume.Name]; !ok && (vmiVolume.DataVolume != nil || vmiVolume.PersistentVolumeClaim != nil || vmiVolume.MemoryDump != nil) {
+		if _, ok := podVolumeMap[vmiVolume.Name]; !ok && (vmiVolume.DataVolume != nil || vmiVolume.PersistentVolumeClaim != nil || vmiVolume.MemoryDump != nil || (vmiVolume.EjectedCDRom != nil && includeEjectedCDRoms)) {
 			hotplugVolumes = append(hotplugVolumes, vmiVolume.DeepCopy())
 		}
 	}
@@ -2092,7 +2092,7 @@ func (c *VMIController) updateVolumeStatus(vmi *virtv1.VirtualMachineInstance, v
 		oldStatusMap[status.Name] = status
 	}
 
-	hotplugVolumes := getHotplugVolumes(vmi, virtlauncherPod)
+	hotplugVolumes := getHotplugVolumes(vmi, virtlauncherPod, false)
 	hotplugVolumesMap := make(map[string]*virtv1.Volume)
 	for _, volume := range hotplugVolumes {
 		hotplugVolumesMap[volume.Name] = volume
@@ -2111,8 +2111,7 @@ func (c *VMIController) updateVolumeStatus(vmi *virtv1.VirtualMachineInstance, v
 		} else {
 			status.Name = volume.Name
 		}
-		// Remove from map so I can detect existing volumes that have been removed from spec.
-		delete(oldStatusMap, volume.Name)
+
 		if _, ok := hotplugVolumesMap[volume.Name]; ok {
 			// Hotplugged volume
 			if status.HotplugVolume == nil {
@@ -2168,6 +2167,32 @@ func (c *VMIController) updateVolumeStatus(vmi *virtv1.VirtualMachineInstance, v
 				status.PersistentVolumeClaimInfo.FilesystemOverhead = &filesystemOverhead
 			}
 		}
+
+		if volume.EjectedCDRom != nil {
+			status = virtv1.VolumeStatus{}
+			if oldStatus, ok := oldStatusMap[volume.Name]; ok {
+				if oldStatus.Target == "" {
+					err := fmt.Errorf("volume %s is ejected CDRom type, but there was no target for previously attached volume in volumeStatus", volume.Name)
+					log.Log.Reason(err)
+					return err
+				}
+
+				status.Name = oldStatus.Name
+				status.Target = oldStatus.Target
+				status.Phase = oldStatus.Phase
+				if status.Phase != virtv1.EjectedCDRom && status.Phase != virtv1.EjectingCDRom {
+					status.Phase = virtv1.EjectingCDRom
+				}
+			} else {
+				// There was no corresponding volume in the old status. This is a newly
+				// added volume as an ejected CDRom.
+				status.Name = volume.Name
+				status.Phase = virtv1.EjectingCDRom
+			}
+		}
+
+		// Remove from map so we can detect existing volumes that have been removed from spec.
+		delete(oldStatusMap, volume.Name)
 
 		newStatus = append(newStatus, status)
 	}

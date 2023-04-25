@@ -39,6 +39,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 	k8sv1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"libvirt.org/go/libvirt"
@@ -48,6 +49,7 @@ import (
 	v1 "kubevirt.io/api/core/v1"
 
 	cloudinit "kubevirt.io/kubevirt/pkg/cloud-init"
+	"kubevirt.io/kubevirt/pkg/controller"
 	ephemeraldiskutils "kubevirt.io/kubevirt/pkg/ephemeral-disk-utils"
 	"kubevirt.io/kubevirt/pkg/ephemeral-disk/fake"
 	cmdv1 "kubevirt.io/kubevirt/pkg/handler-launcher-com/cmd/v1"
@@ -383,13 +385,26 @@ var _ = Describe("Manager", func() {
 
 	expectedDomainFor := func(vmi *v1.VirtualMachineInstance) *api.DomainSpec {
 		domain := &api.Domain{}
-		hotplugVolumes := make(map[string]v1.VolumeStatus)
-		permanentVolumes := make(map[string]v1.VolumeStatus)
+		statusMap := make(map[string]v1.VolumeStatus)
 		for _, status := range vmi.Status.VolumeStatus {
-			if status.HotplugVolume != nil {
-				hotplugVolumes[status.Name] = status
-			} else {
-				permanentVolumes[status.Name] = status
+			statusMap[status.Name] = status
+		}
+
+		hotplugVolumes := make(map[string]*v1.VolumeStatus)
+		permanentVolumes := make(map[string]*v1.VolumeStatus)
+		for _, volume := range vmi.Spec.Volumes {
+			var status *v1.VolumeStatus
+			foundStatus, ok := statusMap[volume.Name]
+			if ok {
+				status = &foundStatus
+			}
+
+			if controller.IsHotpluggableVolume(volume, status) {
+				hotplugVolumes[volume.Name] = status
+			} else if ok {
+				// Following old logic - only add to permanent volumes if it is in the
+				// statusMap, otherwise do not add to either.
+				permanentVolumes[volume.Name] = status
 			}
 		}
 
@@ -417,6 +432,72 @@ var _ = Describe("Manager", func() {
 	}
 
 	Context("on successful VirtualMachineInstance sync", func() {
+		makeVolume := func(name string, kind string, isHotPluggable bool) v1.Volume {
+			volume := v1.Volume{}
+			volume.Name = fmt.Sprintf("volume-name-%s", name)
+
+			if kind == "pvc" {
+				volume.VolumeSource = v1.VolumeSource{
+					PersistentVolumeClaim: &v1.PersistentVolumeClaimVolumeSource{
+						Hotpluggable: isHotPluggable,
+					},
+				}
+			} else if kind == "dv" {
+				volume.VolumeSource = v1.VolumeSource{
+					DataVolume: &v1.DataVolumeSource{
+						Hotpluggable: isHotPluggable,
+						Name:         fmt.Sprintf("dv-name-%s", name),
+					},
+				}
+			} else if kind == "ejectedcdrom" {
+				volume.VolumeSource = v1.VolumeSource{
+					EjectedCDRom: &v1.EjectedCDRomSource{},
+				}
+			}
+
+			return volume
+		}
+
+		makeDisk := func(name string, isCDRom bool) v1.Disk {
+			disk := v1.Disk{}
+			disk.Name = fmt.Sprintf("volume-name-%s", name)
+
+			if isCDRom {
+				disk.DiskDevice = v1.DiskDevice{
+					CDRom: &v1.CDRomTarget{
+						Bus: "sata",
+					},
+				}
+			} else {
+				disk.DiskDevice = v1.DiskDevice{
+					Disk: &v1.DiskTarget{
+						Bus: "scsi",
+					},
+				}
+			}
+
+			return disk
+		}
+
+		createDelayedVMI := func(volumeKind string, volumeStatusPhase v1.VolumePhase, isDiskCDRom bool) *v1.VirtualMachineInstance {
+			vmi := newVMI(testNamespace, testVmName)
+			vmi.Spec.Volumes = []v1.Volume{
+				makeVolume("vol1", volumeKind, true),
+			}
+			vmi.Status.VolumeStatus = []v1.VolumeStatus{
+				{
+					Name:  "vol1",
+					Phase: volumeStatusPhase,
+				},
+			}
+
+			vmi.Spec.Domain.Devices.Disks = []v1.Disk{
+				makeDisk("vol1", isDiskCDRom),
+			}
+
+			return vmi
+		}
+
 		It("should define and start a new VirtualMachineInstance", func() {
 			vmi := newVMI(testNamespace, testVmName)
 			mockConn.EXPECT().LookupDomainByName(testDomainName).Return(nil, libvirt.Error{Code: libvirt.ERR_NO_DOMAIN})
@@ -434,6 +515,35 @@ var _ = Describe("Manager", func() {
 			Expect(err).ToNot(HaveOccurred())
 			Expect(newspec).ToNot(BeNil())
 		})
+		DescribeTable("should delay libvirt start if there are unready hotplugged volumes", func(vmi *v1.VirtualMachineInstance) {
+			mockConn.EXPECT().LookupDomainByName(testDomainName).Return(mockDomain, libvirt.Error{Code: libvirt.ERR_NO_DOMAIN})
+
+			domainSpec := expectedDomainFor(vmi)
+
+			_, err := xml.MarshalIndent(domainSpec, "", "\t")
+			Expect(err).ToNot(HaveOccurred())
+			mockConn.EXPECT().DomainDefineXML(gomock.Any()).Times(0)
+			mockDomain.EXPECT().GetState().Times(0)
+			mockDomain.EXPECT().CreateWithFlags(gomock.Any()).Times(0)
+			manager, _ := NewLibvirtDomainManager(mockConn, testVirtShareDir, testEphemeralDiskDir, nil, "/usr/share/OVMF", ephemeralDiskCreatorMock, metadataCache)
+			newspec, err := manager.SyncVMI(vmi, true, &cmdv1.VirtualMachineOptions{VirtualMachineSMBios: &cmdv1.SMBios{}})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(newspec).To(BeNil())
+		},
+			Entry(
+				"for unready dv",
+				createDelayedVMI("dv", v1.HotplugVolumeMounted, false),
+			),
+			Entry(
+				"for unready pvc",
+				createDelayedVMI("pvc", v1.VolumeBound, false),
+			),
+			Entry(
+				"for unready dv with VolumePending",
+				createDelayedVMI("dv", v1.VolumePending, false),
+			),
+		)
+
 		It("should define and start a new VirtualMachineInstance with StartStrategy paused", func() {
 			vmi := newVMI(testNamespace, testVmName)
 			strategy := v1.StartStrategyPaused
@@ -1040,6 +1150,295 @@ var _ = Describe("Manager", func() {
 			mockDomain.EXPECT().CreateWithFlags(libvirt.DOMAIN_NONE).Return(nil)
 			mockDomain.EXPECT().DetachDeviceFlags(strings.ToLower(string(detachBytes)), affectLiveAndConfigLibvirtFlags)
 			mockDomain.EXPECT().GetXMLDesc(libvirt.DomainXMLFlags(0)).MaxTimes(2).Return(string(xmlDomain), nil)
+			manager, _ := newLibvirtDomainManager(mockConn, testVirtShareDir, testEphemeralDiskDir, nil, "/usr/share/OVMF", ephemeralDiskCreatorMock, mockDirectIOChecker, metadataCache)
+			newspec, err := manager.SyncVMI(vmi, true, &cmdv1.VirtualMachineOptions{VirtualMachineSMBios: &cmdv1.SMBios{}})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(newspec).ToNot(BeNil())
+		})
+		It("should insert a cdrom if changing from ejected to inserted", func() {
+			// Make sure that we always free the domain after use
+			mockDomain.EXPECT().Free()
+			vmi := newVMI(testNamespace, testVmName)
+			vmi.Spec.Domain.Devices.Disks = []v1.Disk{
+				{
+					Name: "permvolume1",
+					DiskDevice: v1.DiskDevice{
+						Disk: &v1.DiskTarget{
+							Bus: v1.DiskBusVirtio,
+						},
+					},
+					Cache: "none",
+				},
+				{
+					Name: "hpvolume1",
+					DiskDevice: v1.DiskDevice{
+						CDRom: &v1.CDRomTarget{
+							Bus: "sata",
+						},
+					},
+					Cache: "none",
+				},
+			}
+			vmi.Spec.Volumes = []v1.Volume{
+				{
+					Name: "permvolume1",
+					VolumeSource: v1.VolumeSource{
+						DataVolume: &v1.DataVolumeSource{
+							Name: "dv1",
+						},
+					},
+				},
+				{
+					Name: "hpvolume1",
+					VolumeSource: v1.VolumeSource{
+						DataVolume: &v1.DataVolumeSource{
+							Name: "dv2",
+						},
+					},
+				},
+			}
+			vmi.Status.VolumeStatus = []v1.VolumeStatus{
+				{
+					Name:  "permvolume1",
+					Phase: v1.VolumeReady,
+				},
+				{
+					Name:  "hpvolume1",
+					Phase: v1.VolumeReady,
+					HotplugVolume: &v1.HotplugVolumeStatus{
+						AttachPodName: "testpod1",
+						AttachPodUID:  "abcd",
+					},
+					Target: "sda",
+				},
+			}
+			isBlockDeviceVolume = func(volumeName string) (bool, error) {
+				if volumeName == "dv1" {
+					return true, nil
+				}
+				return false, nil
+			}
+			mockConn.EXPECT().LookupDomainByName(testDomainName).Return(mockDomain, libvirt.Error{Code: libvirt.ERR_NO_DOMAIN})
+			domainSpec := expectedDomainFor(vmi)
+			xmlDomain, err := xml.MarshalIndent(domainSpec, "", "\t")
+			Expect(err).ToNot(HaveOccurred())
+			checkIfDiskReadyToUse = func(filename string) (bool, error) {
+				Expect(filename).To(Equal(filepath.Join(v1.HotplugDiskDir, "/hpvolume1.img")))
+				return true, nil
+			}
+			domainSpec.Devices.Disks = []api.Disk{
+				{
+					Device: "disk",
+					Type:   "file",
+					Source: api.DiskSource{
+						File: "/var/run/kubevirt-private/vmi-disks/permvolume1/disk.img",
+					},
+					Target: api.DiskTarget{
+						Bus:    v1.DiskBusVirtio,
+						Device: "vda",
+					},
+					Driver: &api.DiskDriver{
+						Cache:       "none",
+						Name:        "qemu",
+						Type:        "raw",
+						IO:          "native",
+						ErrorPolicy: "stop",
+					},
+					Alias: api.NewUserDefinedAlias("permvolume1"),
+				},
+				{
+					Device: "cdrom",
+					Type:   "file",
+					Source: api.DiskSource{
+						File: "",
+					},
+					Target: api.DiskTarget{
+						Bus:    v1.DiskBusSATA,
+						Device: "sda",
+					},
+					Driver: &api.DiskDriver{
+						Cache:       "none",
+						Name:        "qemu",
+						Type:        "raw",
+						IO:          "native",
+						ErrorPolicy: "stop",
+						Discard:     "unmap",
+					},
+					Alias: api.NewUserDefinedAlias("hpvolume1"),
+				},
+			}
+			insertDisk := api.Disk{
+				Device: "cdrom",
+				Type:   "file",
+				Source: api.DiskSource{
+					File: filepath.Join(v1.HotplugDiskDir, "hpvolume1.img"),
+				},
+				Target: api.DiskTarget{
+					Bus:    "sata",
+					Device: "sda",
+				},
+				Driver: &api.DiskDriver{
+					Cache:       "none",
+					Name:        "qemu",
+					Type:        "raw",
+					IO:          "native",
+					ErrorPolicy: "stop",
+					Discard:     "unmap",
+				},
+				Alias: api.NewUserDefinedAlias("hpvolume1"),
+			}
+
+			xmlDomain2, err := xml.MarshalIndent(domainSpec, "", "\t")
+			Expect(err).ToNot(HaveOccurred())
+			attachBytes, err := xml.Marshal(insertDisk)
+			Expect(err).ToNot(HaveOccurred())
+			mockConn.EXPECT().DomainDefineXML(string(xmlDomain)).Return(mockDomain, nil)
+			mockDomain.EXPECT().GetState().Return(libvirt.DOMAIN_SHUTDOWN, 1, nil)
+			mockDomain.EXPECT().CreateWithFlags(libvirt.DOMAIN_NONE).Return(nil)
+			mockDomain.EXPECT().UpdateDeviceFlags(strings.ToLower(string(attachBytes)), affectLiveAndConfigLibvirtFlags)
+			mockDomain.EXPECT().GetXMLDesc(libvirt.DomainXMLFlags(0)).MaxTimes(2).Return(string(xmlDomain2), nil)
+			manager, _ := newLibvirtDomainManager(mockConn, testVirtShareDir, testEphemeralDiskDir, nil, "/usr/share/OVMF", ephemeralDiskCreatorMock, mockDirectIOChecker, metadataCache)
+			newspec, err := manager.SyncVMI(vmi, true, &cmdv1.VirtualMachineOptions{VirtualMachineSMBios: &cmdv1.SMBios{}})
+			Expect(err).ToNot(HaveOccurred())
+			Expect(newspec).ToNot(BeNil())
+		})
+		It("should eject a cdrom if changing from inserted to ejected", func() {
+			// Make sure that we always free the domain after use
+			mockDomain.EXPECT().Free()
+			vmi := newVMI(testNamespace, testVmName)
+			vmi.Spec.Domain.Devices.Disks = []v1.Disk{
+				{
+					Name: "permvolume1",
+					DiskDevice: v1.DiskDevice{
+						Disk: &v1.DiskTarget{
+							Bus: v1.DiskBusVirtio,
+						},
+					},
+					Cache: "none",
+				},
+				{
+					Name: "hpvolume1",
+					DiskDevice: v1.DiskDevice{
+						CDRom: &v1.CDRomTarget{
+							Bus: "sata",
+						},
+					},
+					Cache: "none",
+				},
+			}
+			vmi.Spec.Volumes = []v1.Volume{
+				{
+					Name: "permvolume1",
+					VolumeSource: v1.VolumeSource{
+						DataVolume: &v1.DataVolumeSource{
+							Name: "dv1",
+						},
+					},
+				},
+				{
+					Name: "hpvolume1",
+					VolumeSource: v1.VolumeSource{
+						EjectedCDRom: &v1.EjectedCDRomSource{},
+					},
+				},
+			}
+			vmi.Status.VolumeStatus = []v1.VolumeStatus{
+				{
+					Name:  "permvolume1",
+					Phase: v1.VolumeReady,
+				},
+				{
+					Name:   "hpvolume1",
+					Phase:  v1.EjectingCDRom,
+					Target: "sda",
+				},
+			}
+			isBlockDeviceVolume = func(volumeName string) (bool, error) {
+				if volumeName == "dv1" {
+					return true, nil
+				}
+				return false, nil
+			}
+			mockConn.EXPECT().LookupDomainByName(testDomainName).Return(mockDomain, libvirt.Error{Code: libvirt.ERR_NO_DOMAIN})
+			domainSpec := expectedDomainFor(vmi)
+			// xmlDomain, err := xml.MarshalIndent(domainSpec, "", "\t")
+			// Expect(err).ToNot(HaveOccurred())
+			checkIfDiskReadyToUse = func(filename string) (bool, error) {
+				Expect(filename).To(Equal(filepath.Join(v1.HotplugDiskDir, "/hpvolume1.img")))
+				return true, nil
+			}
+			domainSpec.Devices.Disks = []api.Disk{
+				{
+					Device: "disk",
+					Type:   "file",
+					Model:  "virtio-non-transitional",
+					Source: api.DiskSource{
+						File: "/var/run/kubevirt-private/vmi-disks/permvolume1/disk.img",
+					},
+					Target: api.DiskTarget{
+						Bus:    v1.DiskBusVirtio,
+						Device: "vda",
+					},
+					Driver: &api.DiskDriver{
+						Cache:       "none",
+						Name:        "qemu",
+						Type:        "raw",
+						IO:          "native",
+						ErrorPolicy: "stop",
+						Discard:     "unmap",
+					},
+					Alias: api.NewUserDefinedAlias("permvolume1"),
+				},
+				{
+					Device: "cdrom",
+					Type:   "file",
+					Source: api.DiskSource{
+						File: filepath.Join(v1.HotplugDiskDir, "hpvolume1.img"),
+					},
+					Target: api.DiskTarget{
+						Bus:    "sata",
+						Device: "sda",
+					},
+					Driver: &api.DiskDriver{
+						Cache:       "none",
+						Name:        "qemu",
+						Type:        "raw",
+						ErrorPolicy: "stop",
+						Discard:     "unmap",
+						IO:          "native",
+					},
+					Alias: api.NewUserDefinedAlias("hpvolume1"),
+				},
+			}
+			ejectDisk := api.Disk{
+				Device: "cdrom",
+				Type:   "file",
+				Source: api.DiskSource{
+					File: "",
+				},
+				Target: api.DiskTarget{
+					Bus:    v1.DiskBusSATA,
+					Device: "sda",
+				},
+				Driver: &api.DiskDriver{
+					Cache:       "none",
+					Name:        "qemu",
+					Type:        "raw",
+					ErrorPolicy: "stop",
+					Discard:     "unmap",
+					IO:          "native",
+				},
+				Alias: api.NewUserDefinedAlias("hpvolume1"),
+			}
+			xmlDomain2, err := xml.MarshalIndent(domainSpec, "", "\t")
+			Expect(err).ToNot(HaveOccurred())
+			attachBytes, err := xml.Marshal(ejectDisk)
+			Expect(err).ToNot(HaveOccurred())
+			mockConn.EXPECT().DomainDefineXML(gomock.Any()).Return(mockDomain, nil)
+			mockDomain.EXPECT().GetState().Return(libvirt.DOMAIN_SHUTDOWN, 1, nil)
+			mockDomain.EXPECT().CreateWithFlags(libvirt.DOMAIN_NONE).Return(nil)
+			mockDomain.EXPECT().UpdateDeviceFlags(strings.ToLower(string(attachBytes)), affectLiveAndConfigLibvirtFlags)
+			mockDomain.EXPECT().GetXMLDesc(libvirt.DomainXMLFlags(0)).MaxTimes(2).Return(string(xmlDomain2), nil)
 			manager, _ := newLibvirtDomainManager(mockConn, testVirtShareDir, testEphemeralDiskDir, nil, "/usr/share/OVMF", ephemeralDiskCreatorMock, mockDirectIOChecker, metadataCache)
 			newspec, err := manager.SyncVMI(vmi, true, &cmdv1.VirtualMachineOptions{VirtualMachineSMBios: &cmdv1.SMBios{}})
 			Expect(err).ToNot(HaveOccurred())
@@ -2214,14 +2613,17 @@ var _ = Describe("Manager", func() {
 })
 
 var _ = Describe("getAttachedDisks", func() {
-	DescribeTable("should return the correct values", func(oldDisks, newDisks, expected []api.Disk) {
-		res := getAttachedDisks(oldDisks, newDisks)
+	DescribeTable("should return the correct values", func(oldDisks, newDisks, expected []api.Disk, newlyEjectedCDRoms, newlyInsertedCDRoms map[string]api.Disk) {
+		res := getAttachedDisks(oldDisks, newDisks, newlyEjectedCDRoms, newlyInsertedCDRoms)
 		Expect(res).To(Equal(expected))
 	},
 		Entry("be empty with empty old and new",
 			[]api.Disk{},
 			[]api.Disk{},
-			[]api.Disk{}),
+			[]api.Disk{},
+			map[string]api.Disk{},
+			map[string]api.Disk{},
+		),
 		Entry("be empty with empty old and new being identical",
 			[]api.Disk{
 				{
@@ -2239,7 +2641,10 @@ var _ = Describe("getAttachedDisks", func() {
 					},
 				},
 			},
-			[]api.Disk{}),
+			[]api.Disk{},
+			map[string]api.Disk{},
+			map[string]api.Disk{},
+		),
 		Entry("contain a new disk with empty having a new disk compared to old",
 			[]api.Disk{
 				{
@@ -2270,7 +2675,10 @@ var _ = Describe("getAttachedDisks", func() {
 						File: filepath.Join(v1.HotplugDiskDir, "file2"),
 					},
 				},
-			}),
+			},
+			map[string]api.Disk{},
+			map[string]api.Disk{},
+		),
 		Entry("be empty if non-hotplug disk is added",
 			[]api.Disk{
 				{
@@ -2294,19 +2702,79 @@ var _ = Describe("getAttachedDisks", func() {
 					},
 				},
 			},
-			[]api.Disk{}),
+			[]api.Disk{},
+			map[string]api.Disk{},
+			map[string]api.Disk{},
+		),
+		Entry("should ignore newlyEjectedCDRoms and newlyInsertedCDRoms",
+			[]api.Disk{
+				{
+					Source: api.DiskSource{
+						Name: "test",
+						File: "file",
+					},
+				},
+			},
+			[]api.Disk{
+				{
+					Source: api.DiskSource{
+						Name: "test",
+						File: "file",
+					},
+				},
+				{
+					Source: api.DiskSource{
+						Name: "test2",
+						File: filepath.Join(v1.HotplugDiskDir, "file2"),
+					},
+					Target: api.DiskTarget{Device: "test2"},
+				},
+				{
+					Source: api.DiskSource{
+						Name: "test3",
+						File: filepath.Join(v1.HotplugDiskDir, "file3"),
+					},
+					Target: api.DiskTarget{Device: "test3"},
+				},
+				{
+					Source: api.DiskSource{
+						Name: "test4",
+						File: filepath.Join(v1.HotplugDiskDir, "file4"),
+					},
+					Target: api.DiskTarget{Device: "test4"},
+				},
+			},
+			[]api.Disk{
+				{
+					Source: api.DiskSource{
+						Name: "test2",
+						File: filepath.Join(v1.HotplugDiskDir, "file2"),
+					},
+					Target: api.DiskTarget{Device: "test2"},
+				},
+			},
+			map[string]api.Disk{
+				"test3": api.Disk{},
+			},
+			map[string]api.Disk{
+				"test4": api.Disk{},
+			},
+		),
 	)
 })
 
 var _ = Describe("getDetachedDisks", func() {
-	DescribeTable("should return the correct values", func(oldDisks, newDisks, expected []api.Disk) {
-		res := getDetachedDisks(oldDisks, newDisks)
+	DescribeTable("should return the correct values", func(oldDisks, newDisks, expected []api.Disk, newlyEjectedCDRoms, newlyInsertedCDRoms map[string]api.Disk) {
+		res := getDetachedDisks(oldDisks, newDisks, newlyEjectedCDRoms, newlyInsertedCDRoms)
 		Expect(res).To(Equal(expected))
 	},
 		Entry("be empty with empty old and new",
 			[]api.Disk{},
 			[]api.Disk{},
-			[]api.Disk{}),
+			[]api.Disk{},
+			map[string]api.Disk{},
+			map[string]api.Disk{},
+		),
 		Entry("be empty with empty old and new being identical",
 			[]api.Disk{
 				{
@@ -2324,7 +2792,10 @@ var _ = Describe("getDetachedDisks", func() {
 					},
 				},
 			},
-			[]api.Disk{}),
+			[]api.Disk{},
+			map[string]api.Disk{},
+			map[string]api.Disk{},
+		),
 		Entry("contains something if new has less than old",
 			[]api.Disk{
 				{
@@ -2355,7 +2826,10 @@ var _ = Describe("getDetachedDisks", func() {
 						File: filepath.Join(v1.HotplugDiskDir, "file2"),
 					},
 				},
-			}),
+			},
+			map[string]api.Disk{},
+			map[string]api.Disk{},
+		),
 		Entry("be empty if non-hotplug disk changed",
 			[]api.Disk{
 				{
@@ -2373,7 +2847,272 @@ var _ = Describe("getDetachedDisks", func() {
 					},
 				},
 			},
-			[]api.Disk{}),
+			[]api.Disk{},
+			map[string]api.Disk{},
+			map[string]api.Disk{},
+		),
+		Entry("should ignore newlyInsertedCDRoms and newlyEjectedCDRoms",
+			[]api.Disk{
+				{
+					Source: api.DiskSource{
+						Name: "test",
+						File: "file",
+					},
+				},
+				{
+					Source: api.DiskSource{
+						Name: "test2",
+						File: filepath.Join(v1.HotplugDiskDir, "file2"),
+					},
+					Target: api.DiskTarget{Device: "test2"},
+				},
+				{
+					Source: api.DiskSource{
+						Name: "test3",
+						File: filepath.Join(v1.HotplugDiskDir, "file3"),
+					},
+					Target: api.DiskTarget{Device: "test3"},
+				},
+				{
+					Source: api.DiskSource{
+						Name: "test4",
+						File: filepath.Join(v1.HotplugDiskDir, "file4"),
+					},
+					Target: api.DiskTarget{Device: "test4"},
+				},
+			},
+			[]api.Disk{
+				{
+					Source: api.DiskSource{
+						Name: "test",
+						File: "file",
+					},
+				},
+			},
+			[]api.Disk{
+				{
+					Source: api.DiskSource{
+						Name: "test2",
+						File: filepath.Join(v1.HotplugDiskDir, "file2"),
+					},
+					Target: api.DiskTarget{Device: "test2"},
+				},
+			},
+			map[string]api.Disk{
+				"test3": api.Disk{},
+			},
+			map[string]api.Disk{
+				"test4": api.Disk{},
+			},
+		),
+	)
+})
+
+var _ = Describe("helper functions", func() {
+	makeAPIDisk := func(name string, isEjectedCDRom bool, isInsertedCDRom bool) api.Disk {
+		disk := api.Disk{}
+		disk.Target.Device = fmt.Sprintf("target-%s", name)
+
+		if isEjectedCDRom {
+			disk.Device = "cdrom"
+			disk.Source.File = ""
+		} else if isInsertedCDRom {
+			disk.Device = "cdrom"
+			disk.Source.File = "diskpath"
+		}
+
+		return disk
+	}
+
+	makeMapFromDisks := func(disks []api.Disk) map[string]api.Disk {
+		res := make(map[string]api.Disk, 0)
+		for _, disk := range disks {
+			res[disk.Target.Device] = disk
+		}
+		return res
+	}
+
+	DescribeTable("Should get overlap", func(disks1 []api.Disk, disks2 []api.Disk, expected []api.Disk) {
+		res := getOverlap(makeMapFromDisks(disks1), makeMapFromDisks(disks2))
+		Expect(equality.Semantic.DeepEqual(res, makeMapFromDisks(expected))).To(BeTrue(), "result: %v and expected: %v do not match", res, expected)
+	},
+		Entry("Should be empty if there are no disks", []api.Disk{}, []api.Disk{makeAPIDisk("vol1", false, false)}, []api.Disk{}),
+		Entry("Should be empty if there are no secondary disks", []api.Disk{makeAPIDisk("vol1", false, false)}, []api.Disk{}, []api.Disk{}),
+		Entry("Should get overlap of multiple disks",
+			[]api.Disk{
+				makeAPIDisk("vol1", false, false),
+				makeAPIDisk("vol2", false, false),
+				makeAPIDisk("notin2", false, false),
+			},
+			[]api.Disk{
+				makeAPIDisk("vol1", false, false),
+				makeAPIDisk("notin1", false, false),
+				makeAPIDisk("notin1-2", false, false),
+				makeAPIDisk("notin1-3", false, false),
+				makeAPIDisk("vol2", false, false),
+				makeAPIDisk("notin1-4", false, false),
+			},
+			[]api.Disk{
+				makeAPIDisk("vol1", false, false),
+				makeAPIDisk("vol2", false, false),
+			},
+		),
+	)
+
+	DescribeTable("Should copy immutable values from the old disk", func(newDisk api.Disk, oldDisks []api.Disk, expectedDisk api.Disk, expectError bool) {
+		err := copyImmutableValuesFromOldDisk(&newDisk, oldDisks)
+		if expectError {
+			Expect(err).To(HaveOccurred())
+		} else {
+			fmt.Printf("newDisk Driver: %+v", newDisk.Driver)
+			Expect(equality.Semantic.DeepEqual(newDisk, expectedDisk)).To(BeTrue(), "result: %+v and expected: %+v do not match", newDisk, expectedDisk)
+			Expect(err).ToNot(HaveOccurred())
+		}
+	},
+		Entry("Should succeed and copy the correct immutable values",
+			api.Disk{
+				Device: "newDevice",
+				Type:   "newType",
+				Target: api.DiskTarget{
+					Device: "sameTarget",
+					Tray:   "newTray",
+					Bus:    v1.DiskBusSATA,
+				},
+				Driver: &api.DiskDriver{
+					IO:      v1.IONative,
+					Cache:   "newCache",
+					Discard: "newDiscard",
+					Type:    "newType",
+				},
+				BootOrder: &api.BootOrder{
+					Order: 1,
+				},
+				Source: api.DiskSource{
+					File: "newFile",
+					Name: "newName",
+				},
+			},
+			[]api.Disk{
+				api.Disk{
+					Device: "oldDevice",
+					Type:   "oldType",
+					Target: api.DiskTarget{
+						Device: "sameTarget",
+						Tray:   "oldTray",
+						Bus:    v1.DiskBusSCSI,
+					},
+					Driver: &api.DiskDriver{
+						Cache:   "oldCache",
+						Discard: "oldDiscard",
+						Type:    "oldType",
+					},
+					BootOrder: &api.BootOrder{
+						Order: 2,
+					},
+					Source: api.DiskSource{
+						File: "oldFile",
+						Name: "oldName",
+					},
+				},
+			},
+			api.Disk{
+				Device: "oldDevice",
+				Type:   "oldType",
+				Target: api.DiskTarget{
+					Device: "sameTarget",
+					Tray:   "oldTray",
+					Bus:    v1.DiskBusSCSI,
+				},
+				Driver: &api.DiskDriver{
+					Cache:   "oldCache",
+					Discard: "oldDiscard",
+					Type:    "newType",
+				},
+				BootOrder: &api.BootOrder{
+					Order: 1,
+				},
+				Source: api.DiskSource{
+					File: "newFile",
+					Name: "oldName",
+				},
+			},
+			false,
+		),
+		Entry("Should fail when there is no matching target device",
+			api.Disk{
+				Device: "newDevice",
+				Type:   "newType",
+				Target: api.DiskTarget{
+					Device: "newTarget",
+					Tray:   "newTray",
+					Bus:    v1.DiskBusSATA,
+				},
+				Driver: &api.DiskDriver{
+					Cache:   "newCache",
+					Discard: "newDiscard",
+					Type:    "newType",
+				},
+				BootOrder: &api.BootOrder{
+					Order: 1,
+				},
+				Source: api.DiskSource{
+					File: "newFile",
+					Name: "newName",
+				},
+			},
+			[]api.Disk{
+				api.Disk{
+					Device: "oldDevice",
+					Type:   "oldType",
+					Target: api.DiskTarget{
+						Device: "oldTarget",
+						Tray:   "oldTray",
+						Bus:    v1.DiskBusSCSI,
+					},
+					Driver: &api.DiskDriver{
+						IO:      v1.IOThreads,
+						Cache:   "oldCache",
+						Discard: "oldDiscard",
+						Type:    "oldType",
+					},
+					BootOrder: &api.BootOrder{
+						Order: 2,
+					},
+					Source: api.DiskSource{
+						File: "oldFile",
+						Name: "oldName",
+					},
+				},
+			},
+			api.Disk{},
+			true,
+		),
+	)
+
+	DescribeTable("Should get CDRoms", func(disks1 []api.Disk, expected1 []api.Disk, expected2 []api.Disk) {
+		res1, res2 := getCDRoms(disks1)
+		Expect(equality.Semantic.DeepEqual(res1, makeMapFromDisks(expected1))).To(BeTrue(), "result: %v and expected: %v do not match", res1, makeMapFromDisks(expected1))
+		Expect(equality.Semantic.DeepEqual(res2, makeMapFromDisks(expected2))).To(BeTrue(), "result: %v and expected: %v do not match", res2, makeMapFromDisks(expected2))
+	},
+		Entry("Should be empty if there are no disks", []api.Disk{}, []api.Disk{}, []api.Disk{}),
+		Entry("Should get inserted and ejected correctly",
+			[]api.Disk{
+				makeAPIDisk("vol1", false, false),
+				makeAPIDisk("vol2-inserted", false, true),
+				makeAPIDisk("vol3-ejected", true, false),
+				makeAPIDisk("vol4", false, false),
+				makeAPIDisk("vol5-inserted", false, true),
+				makeAPIDisk("vol6-ejected", true, false),
+			},
+			[]api.Disk{
+				makeAPIDisk("vol3-ejected", true, false),
+				makeAPIDisk("vol6-ejected", true, false),
+			},
+			[]api.Disk{
+				makeAPIDisk("vol2-inserted", false, true),
+				makeAPIDisk("vol5-inserted", false, true),
+			},
+		),
 	)
 })
 
@@ -2390,10 +3129,8 @@ var _ = Describe("migratableDomXML", func() {
   <kubevirt><migration>this should stay</migration></kubevirt>
 </domain>`
 		// migratableDomXML() removes the migration block but not its ident, which is its own token, hence the blank line below
-		expectedXML := `<domain type="kvm" id="1">
-  <name>kubevirt</name>
-  <kubevirt><migration>this should stay</migration></kubevirt>
-</domain>`
+		// Had to update \n spacing so keeping it as one solid string
+		expectedXML := "<domain type=\"kvm\" id=\"1\">\n  <name>kubevirt</name>\n  <kubevirt><migration>this should stay</migration></kubevirt>\n</domain>"
 		vmi := newVMI("testns", "kubevirt")
 		mockDomain.EXPECT().GetXMLDesc(libvirt.DOMAIN_XML_MIGRATABLE).MaxTimes(1).Return(domXML, nil)
 		domSpec := &api.DomainSpec{}
@@ -2412,15 +3149,8 @@ var _ = Describe("migratableDomXML", func() {
   </cputune>
 </domain>`
 		// migratableDomXML() removes the migration block but not its ident, which is its own token, hence the blank line below
-		expectedXML := `<domain type="kvm" id="1">
-  <name>kubevirt</name>
-  <vcpu placement="static">2</vcpu>
-  <cputune>
-    <vcpupin vcpu="0" cpuset="6"></vcpupin>
-    <vcpupin vcpu="1" cpuset="7"></vcpupin>
-  </cputune>
-</domain>`
-
+		// Had to update \n spacing so keeping it as one solid string
+		expectedXML := "<domain type=\"kvm\" id=\"1\">\n  <name>kubevirt</name>\n  <vcpu placement=\"static\">2</vcpu>\n  <cputune>\n    <vcpupin vcpu=\"0\" cpuset=\"6\"></vcpupin>\n    <vcpupin vcpu=\"1\" cpuset=\"7\"></vcpupin>\n  </cputune>\n</domain>"
 		By("creating a VMI with dedicated CPU cores")
 		vmi := newVMI("testns", "kubevirt")
 		vmi.Spec.Domain.CPU = &v1.CPU{

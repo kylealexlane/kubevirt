@@ -644,7 +644,8 @@ func (c *VMController) handleVolumeRequests(vm *virtv1.VirtualMachine, vmi *virt
 		}
 
 		if request.AddVolumeOptions != nil {
-			if _, exists := vmiVolumeMap[request.AddVolumeOptions.Name]; exists {
+			vol, exists := vmiVolumeMap[request.AddVolumeOptions.Name]
+			if exists && !(vol.EjectedCDRom != nil && controller.IsInsertCDRomRequest(&request)) {
 				continue
 			}
 
@@ -652,7 +653,11 @@ func (c *VMController) handleVolumeRequests(vm *virtv1.VirtualMachine, vmi *virt
 				return err
 			}
 		} else if request.RemoveVolumeOptions != nil {
-			if _, exists := vmiVolumeMap[request.RemoveVolumeOptions.Name]; !exists {
+			vol, exists := vmiVolumeMap[request.RemoveVolumeOptions.Name]
+			if !exists {
+				continue
+			}
+			if controller.IsEjectCDRomRequest(&request, vmi.Spec.Domain.Devices.Disks) && vol.EjectedCDRom != nil {
 				continue
 			}
 
@@ -2438,6 +2443,8 @@ func (c *VMController) trimDoneVolumeRequests(vm *virtv1.VirtualMachine) {
 		var volName string
 
 		removeRequest := false
+		isEjectCDRomRequest := controller.IsEjectCDRomRequest(&request, vm.Spec.Template.Spec.Domain.Devices.Disks)
+		isInsertCDRomRequest := controller.IsInsertCDRomRequest(&request)
 
 		if request.AddVolumeOptions != nil {
 			volName = request.AddVolumeOptions.Name
@@ -2447,12 +2454,16 @@ func (c *VMController) trimDoneVolumeRequests(vm *virtv1.VirtualMachine) {
 			added = false
 		}
 
-		_, volExists := volumeMap[volName]
+		vol, volExists := volumeMap[volName]
 		_, diskExists := diskMap[volName]
 
-		if added && volExists && diskExists {
+		if added && volExists && diskExists && !isInsertCDRomRequest {
 			removeRequest = true
 		} else if !added && !volExists && !diskExists {
+			removeRequest = true
+		} else if !added && volExists && isEjectCDRomRequest && vol.EjectedCDRom != nil {
+			removeRequest = true
+		} else if added && volExists && isInsertCDRomRequest && vol.EjectedCDRom == nil {
 			removeRequest = true
 		}
 

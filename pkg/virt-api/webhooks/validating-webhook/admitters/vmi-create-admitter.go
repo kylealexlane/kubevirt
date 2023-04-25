@@ -2053,6 +2053,9 @@ func validateVolumes(field *k8sfield.Path, volumes []v1.Volume, config *virtconf
 			memoryDumpVolumeCount++
 			volumeSourceSetCount++
 		}
+		if volume.EjectedCDRom != nil {
+			volumeSourceSetCount++
+		}
 
 		if volumeSourceSetCount != 1 {
 			causes = append(causes, metav1.StatusCause{
