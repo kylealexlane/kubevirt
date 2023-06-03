@@ -15825,7 +15825,6 @@
     "type": "object",
     "required": [
      "name",
-     "disk",
      "volumeSource"
     ],
     "properties": {

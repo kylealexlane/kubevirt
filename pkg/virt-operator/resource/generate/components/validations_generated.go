@@ -7678,7 +7678,6 @@ var CRDsValidation map[string]string = map[string]string{
                         type: object
                     type: object
                 required:
-                - disk
                 - name
                 - volumeSource
                 type: object
@@ -26466,7 +26465,6 @@ var CRDsValidation map[string]string = map[string]string{
                                     type: object
                                 type: object
                             required:
-                            - disk
                             - name
                             - volumeSource
                             type: object

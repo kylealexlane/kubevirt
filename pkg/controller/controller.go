@@ -438,11 +438,11 @@ func VMIHasHotplugVolumes(vmi *v1.VirtualMachineInstance) bool {
 	return false
 }
 
-<<<<<<< HEAD
 func VMIHasHotplugCPU(vmi *v1.VirtualMachineInstance) bool {
 	vmiConditionManager := NewVirtualMachineInstanceConditionManager()
 	return vmiConditionManager.HasCondition(vmi, v1.VirtualMachineInstanceVCPUChange)
-=======
+}
+
 // GetVolumeStatus will return the volume status corresponding to the name.
 // Will return nil if the VolumeStatus is not found.
 func GetVolumeStatus(vmi *v1.VirtualMachineInstance, name string) *v1.VolumeStatus {
@@ -478,7 +478,6 @@ func IsHotpluggableVolume(volume v1.Volume, volumeStatus *v1.VolumeStatus) bool 
 	}
 
 	return false
->>>>>>> 6ad571ea8 (Add CDRom hotplug / hotunplug)
 }
 
 func AttachmentPods(ownerPod *k8sv1.Pod, podInformer cache.SharedIndexInformer) ([]*k8sv1.Pod, error) {

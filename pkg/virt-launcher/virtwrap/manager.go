@@ -1110,7 +1110,7 @@ func (l *LibvirtDomainManager) SyncVMI(vmi *v1.VirtualMachineInstance, allowEmul
 		if err != nil {
 			return nil, err
 		}
-		err = dom.AttachDeviceFlags(strings.ToLower(string(bytes)), affectLiveAndConfigLibvirtFlags)
+		err = dom.AttachDeviceFlags(strings.ToLower(string(bytes)), affectDeviceLiveAndConfigLibvirtFlags)
 		if err != nil {
 			logger.Reason(err).Error("attaching device")
 			return nil, err

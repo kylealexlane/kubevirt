@@ -843,14 +843,22 @@ func (d *VirtualMachineController) generateEventsForVolumeStatusChange(vmi *v1.V
 	}
 }
 
-func (d *VirtualMachineController) updateHotplugVolumeStatus(vmi *v1.VirtualMachineInstance, volumeStatus v1.VolumeStatus, specVolumeMap map[string]v1.Volume) (v1.VolumeStatus, bool) {
+func (d *VirtualMachineController) updateHotplugVolumeStatus(vmi *v1.VirtualMachineInstance, volumeStatus v1.VolumeStatus, specVolumeMap map[string]v1.Volume, hasDiskSource bool) (v1.VolumeStatus, bool) {
 	needsRefresh := false
-	if volumeStatus.Target == "" {
+
+	//TODO: Remove this
+	log.DefaultLogger().Infof("\n Checking volume status %s , for vmi: %+v, which hasSourceFile: %+v, volumeStatus: %+v", volumeStatus.Name, vmi, hasDiskSource, volumeStatus)
+
+	if volumeStatus.Target == "" || !hasDiskSource {
 		needsRefresh = true
 		mounted, err := d.hotplugVolumeMounter.IsMounted(vmi, volumeStatus.Name, volumeStatus.HotplugVolume.AttachPodUID)
 		if err != nil {
 			log.Log.Object(vmi).Errorf("error occurred while checking if volume is mounted: %v", err)
 		}
+
+		// TODO: Remove this
+		log.DefaultLogger().Infof("\n mounted: %+v", mounted)
+
 		if mounted {
 			if _, ok := specVolumeMap[volumeStatus.Name]; ok && canUpdateToMounted(volumeStatus.Phase) {
 				log.DefaultLogger().Infof("Marking volume %s as mounted in pod, it can now be attached", volumeStatus.Name)
@@ -884,9 +892,12 @@ func (d *VirtualMachineController) updateVolumeStatusesFromDomain(vmi *v1.Virtua
 
 	if len(vmi.Status.VolumeStatus) > 0 {
 		diskDeviceMap := make(map[string]string)
+		diskSourceMap := make(map[string]string)
+
 		if domain != nil {
 			for _, disk := range domain.Spec.Devices.Disks {
 				diskDeviceMap[disk.Alias.GetName()] = disk.Target.Device
+				diskSourceMap[disk.Alias.GetName()] = getDiskSource(disk)
 			}
 		}
 		specVolumeMap := make(map[string]v1.Volume)
@@ -898,12 +909,16 @@ func (d *VirtualMachineController) updateVolumeStatusesFromDomain(vmi *v1.Virtua
 		needsRefresh := false
 		for _, volumeStatus := range vmi.Status.VolumeStatus {
 			tmpNeedsRefresh := false
+			hasDiskSource := false
 			if _, ok := diskDeviceMap[volumeStatus.Name]; ok {
 				volumeStatus.Target = diskDeviceMap[volumeStatus.Name]
 			}
+			if diskSource, ok := diskSourceMap[volumeStatus.Name]; ok {
+				hasDiskSource = diskSource != ""
+			}
 			if volumeStatus.HotplugVolume != nil {
 				hasHotplug = true
-				volumeStatus, tmpNeedsRefresh = d.updateHotplugVolumeStatus(vmi, volumeStatus, specVolumeMap)
+				volumeStatus, tmpNeedsRefresh = d.updateHotplugVolumeStatus(vmi, volumeStatus, specVolumeMap, hasDiskSource)
 				needsRefresh = needsRefresh || tmpNeedsRefresh
 			}
 			if volumeStatus.MemoryDumpVolume != nil && domain != nil {
@@ -1404,6 +1419,18 @@ func _guestAgentCommandSubsetSupported(requiredCommands []string, commands []v1.
 	}
 	return true
 
+}
+
+func getDiskSource(disk api.Disk) string {
+	if disk.Source.File != "" {
+		return disk.Source.File
+	}
+
+	if disk.Source.Dev != "" {
+		return disk.Source.Dev
+	}
+
+	return ""
 }
 
 func isGuestAgentSupported(vmi *v1.VirtualMachineInstance, commands []v1.GuestAgentCommandInfo) (bool, string) {
