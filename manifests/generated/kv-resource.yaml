@@ -131,6 +131,8 @@ spec:
                             type: object
                         type: object
                     type: object
+                  appArmorLauncherProfile:
+                    type: string
                   architectureConfiguration:
                     properties:
                       amd64:
@@ -220,6 +222,8 @@ spec:
                           "value". The requirements are ANDed.
                         type: object
                     type: object
+                  appArmorLauncherProfile:
+                    type: string
                   controllerConfiguration:
                     description: ReloadableComponentConfiguration holds all generic
                       k8s configuration options which can be reloaded by components
@@ -3119,6 +3123,8 @@ spec:
                             type: object
                         type: object
                     type: object
+                  appArmorLauncherProfile:
+                    type: string
                   architectureConfiguration:
                     properties:
                       amd64:

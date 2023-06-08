@@ -425,6 +425,17 @@ var _ = Describe("test configuration", func() {
 	)
 
 	DescribeTable(" when OVMFPath", func(cpuArch string, ovmfPathKeyAMD64 string, ovmfPathKeyARM64 string, ovmfPathKeyPPC64le64 string, result string) {
+		clusterConfig, _, _ := testutils.NewFakeClusterConfigUsingKVConfig(&v1.KubeVirtConfiguration{
+			AppArmorLauncherProfile: value,
+		})
+		appArmorProfile := clusterConfig.GetAppArmorLauncherProfile()
+		Expect(appArmorProfile).To(Equal(result))
+	},
+		Entry("when set, GetAppArmorLauncherProfile should return the value", "defaultAAprofile", "defaultAAprofile"),
+		Entry("when unset, GetAppArmorLauncherProfile should return the default", virtconfig.DefaultAppArmorLauncherProfile, virtconfig.DefaultAppArmorLauncherProfile),
+	)
+
+	DescribeTable(" when OVMFPath", func(cpuArch string, ovmfPathKey string, result string) {
 
 		kv := &v1.KubeVirt{
 			ObjectMeta: metav1.ObjectMeta{

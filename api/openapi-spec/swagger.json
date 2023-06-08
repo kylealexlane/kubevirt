@@ -17522,12 +17522,18 @@
      "apiConfiguration": {
       "$ref": "#/definitions/v1.ReloadableComponentConfiguration"
      },
+     "appArmorLauncherProfile": {
+      "type": "string"
+     },
      "architectureConfiguration": {
       "$ref": "#/definitions/v1.ArchConfiguration"
      },
      "autoCPULimitNamespaceLabelSelector": {
       "description": "When set, AutoCPULimitNamespaceLabelSelector will set a CPU limit on virt-launcher for VMIs running inside namespaces that match the label selector. The CPU limit will equal the number of requested vCPUs. This setting does not apply to VMIs with dedicated CPUs.",
       "$ref": "#/definitions/k8s.io.apimachinery.pkg.apis.meta.v1.LabelSelector"
+     },
+     "apparmorLauncherProfile": {
+      "type": "string"
      },
      "controllerConfiguration": {
       "$ref": "#/definitions/v1.ReloadableComponentConfiguration"
@@ -21848,6 +21854,14 @@
     "description": "CPUPreferences contains various optional CPU preferences.",
     "type": "object",
     "properties": {
+     "preferredCPUFeatures": {
+      "description": "PreferredCPUFeatures optionally defines a slice of preferred CPU features.",
+      "type": "array",
+      "items": {
+       "default": {},
+       "$ref": "#/definitions/v1.CPUFeature"
+      }
+     },
      "preferredCPUTopology": {
       "description": "PreferredCPUTopology optionally defines the preferred guest visible CPU topology, defaults to PreferSockets.",
       "type": "string"

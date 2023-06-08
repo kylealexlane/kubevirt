@@ -18841,6 +18841,12 @@ func schema_kubevirtio_api_core_v1_KubeVirtConfiguration(ref common.ReferenceCal
 							Ref: ref("kubevirt.io/api/core/v1.ArchConfiguration"),
 						},
 					},
+					"appArmorLauncherProfile": {
+						SchemaProps: spec.SchemaProps{
+							Type:   []string{"string"},
+							Format: "",
+						},
+					},
 					"evictionStrategy": {
 						SchemaProps: spec.SchemaProps{
 							Description: "EvictionStrategy defines at the cluster level if the VirtualMachineInstance should be migrated instead of shut-off in case of a node drain. If the VirtualMachineInstance specific field is set it overrides the cluster level one.",
@@ -27089,9 +27095,25 @@ func schema_kubevirtio_api_instancetype_v1beta1_CPUPreferences(ref common.Refere
 							Format:      "",
 						},
 					},
+					"preferredCPUFeatures": {
+						SchemaProps: spec.SchemaProps{
+							Description: "PreferredCPUFeatures optionally defines a slice of preferred CPU features.",
+							Type:        []string{"array"},
+							Items: &spec.SchemaOrArray{
+								Schema: &spec.Schema{
+									SchemaProps: spec.SchemaProps{
+										Default: map[string]interface{}{},
+										Ref:     ref("kubevirt.io/api/core/v1.CPUFeature"),
+									},
+								},
+							},
+						},
+					},
 				},
 			},
 		},
+		Dependencies: []string{
+			"kubevirt.io/api/core/v1.CPUFeature"},
 	}
 }
 
