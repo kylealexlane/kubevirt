@@ -1077,6 +1077,9 @@ func (l *LibvirtDomainManager) SyncVMI(vmi *v1.VirtualMachineInstance, allowEmul
 		return nil, err
 	}
 
+	logger.Infof("\n oldSpec.Devices.Disks: %+v", oldSpec.Devices.Disks)
+	logger.Infof("\n domain.Spec.Devices.Disks: %+v", domain.Spec.Devices.Disks)
+
 	newEjectedCDRoms, newInsertedCDRoms := getCDRoms(domain.Spec.Devices.Disks)
 	oldEjectedCDRoms, oldInsertedCDRoms := getCDRoms(oldSpec.Devices.Disks)
 	newlyEjectedCDRoms := getOverlap(newEjectedCDRoms, oldInsertedCDRoms)
@@ -1239,6 +1242,7 @@ func copyImmutableValuesFromOldDisk(newDisk *api.Disk, oldDisks []api.Disk) erro
 
 			// These are some confirmed mutable values during device update.
 			oldDiskCopy.Source.File = newDisk.Source.File
+			oldDiskCopy.Source.Dev = newDisk.Source.Dev
 			oldDiskCopy.Driver.Type = newDisk.Driver.Type
 			oldDiskCopy.BootOrder = newDisk.BootOrder
 
@@ -1389,11 +1393,11 @@ func getCDRoms(disks []api.Disk) (map[string]api.Disk, map[string]api.Disk) {
 }
 
 func isEjectedCDRom(disk api.Disk) bool {
-	return disk.Device == "cdrom" && disk.Source.File == "" && disk.Target.Device != ""
+	return disk.Device == "cdrom" && disk.Source.File == "" && disk.Source.Dev == "" && disk.Target.Device != ""
 }
 
 func isInsertedCDRom(disk api.Disk) bool {
-	return disk.Device == "cdrom" && disk.Source.File != "" && disk.Target.Device != ""
+	return disk.Device == "cdrom" && (disk.Source.File != "" || disk.Source.Dev != "") && disk.Target.Device != ""
 }
 
 func getAttachedDisks(oldDisks []api.Disk, newDisks []api.Disk, newlyEjectedCDRoms map[string]api.Disk, newlyInsertedCDRoms map[string]api.Disk) []api.Disk {

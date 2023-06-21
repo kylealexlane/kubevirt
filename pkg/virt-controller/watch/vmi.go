@@ -730,7 +730,14 @@ func (c *VMIController) updateStatus(vmi *virtv1.VirtualMachineInstance, pod *k8
 
 	case vmi.IsScheduled():
 		// Nothing here
-		break
+		if !vmiPodExists {
+			break
+		}
+
+		if err := c.updateVolumeStatus(vmiCopy, pod); err != nil {
+			return err
+		}
+
 	default:
 		return fmt.Errorf("unknown vmi phase %v", vmi.Status.Phase)
 	}
@@ -2197,12 +2204,6 @@ func (c *VMIController) updateVolumeStatus(vmi *virtv1.VirtualMachineInstance, v
 		if volume.EjectedCDRom != nil {
 			status = virtv1.VolumeStatus{}
 			if oldStatus, ok := oldStatusMap[volume.Name]; ok {
-				if oldStatus.Target == "" {
-					err := fmt.Errorf("volume %s is ejected CDRom type, but there was no target for previously attached volume in volumeStatus", volume.Name)
-					log.Log.Reason(err)
-					return err
-				}
-
 				status.Name = oldStatus.Name
 				status.Target = oldStatus.Target
 				status.Phase = oldStatus.Phase

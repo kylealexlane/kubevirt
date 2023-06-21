@@ -74,10 +74,11 @@ const (
 	removingVolumeFromVM    = "removing volume from VM"
 	verifyingVolumeNotExist = "Verifying the volume no longer exists in VM"
 
-	virtCtlNamespace       = "--namespace"
-	virtCtlVolumeName      = "--volume-name=%s"
-	virtCtlCache           = "--cache=%s"
-	verifyCannotAccessDisk = "ls: %s: No such file or directory"
+	virtCtlNamespace        = "--namespace"
+	virtCtlVolumeName       = "--volume-name=%s"
+	virtCtlCache            = "--cache=%s"
+	verifyCannotAccessDisk  = "ls: %s: No such file or directory"
+	verifyCannotAccessCDROM = "fdisk: cannot open %s: No medium found"
 
 	testNewVolume1 = "some-new-volume1"
 	testNewVolume2 = "some-new-volume2"
@@ -337,7 +338,7 @@ var _ = SIGDescribe("Hotplug", func() {
 			}
 
 			return nil
-		}, 360*time.Second, 1*time.Second).ShouldNot(HaveOccurred())
+		}, 90*time.Second, 1*time.Second).ShouldNot(HaveOccurred())
 	}
 
 	verifyNoVolumeAttached := func(vmi *v1.VirtualMachineInstance, volumeNames ...string) {
@@ -398,6 +399,26 @@ var _ = SIGDescribe("Hotplug", func() {
 			&expect.BExp{R: console.PromptExpression},
 		}
 		Expect(console.SafeExpectBatch(vmi, batch, 20)).To(Succeed())
+	}
+
+	verifyCDROMAttached := func(vmi *v1.VirtualMachineInstance, device string) {
+		Eventually(func() error {
+			return console.SafeExpectBatch(vmi, []expect.Batcher{
+				&expect.BSnd{S: fmt.Sprintf("sudo fdisk -l %s\n", device)},
+				&expect.BExp{R: console.PromptExpression},
+				&expect.BSnd{S: tests.EchoLastReturnValue},
+				&expect.BExp{R: console.RetValue("0")},
+			}, 10)
+		}, 90*time.Second, 2*time.Second).Should(Succeed())
+	}
+
+	verifyCDROMNotAttached := func(vmi *v1.VirtualMachineInstance, device string) {
+		Eventually(func() error {
+			return console.SafeExpectBatch(vmi, []expect.Batcher{
+				&expect.BSnd{S: fmt.Sprintf("sudo fdisk -l %s\n", device)},
+				&expect.BExp{R: fmt.Sprintf(verifyCannotAccessCDROM, device)},
+			}, 10)
+		}, 90*time.Second, 2*time.Second).Should(Succeed())
 	}
 
 	verifyWriteReadData := func(vmi *v1.VirtualMachineInstance, device string) {
@@ -479,10 +500,37 @@ var _ = SIGDescribe("Hotplug", func() {
 		res := make([]string, 0)
 		updatedVMI, err := virtClient.VirtualMachineInstance(vmi.Namespace).Get(context.Background(), vmi.Name, &metav1.GetOptions{})
 		Expect(err).ToNot(HaveOccurred())
+
+		// libvirt has internal mapping for cdroms
+		converterMap := make(map[string]string)
+		converterMap["sda"] = "sr0"
+		converterMap["sdb"] = "sr1"
+		converterMap["sdc"] = "sr2"
+		converterMap["sdd"] = "sr3"
+		converterMap["sde"] = "sr4"
+		converterMap["sdf"] = "sr5"
+		converterMap["sdg"] = "sr6"
+		converterMap["sdh"] = "sr7"
+		converterMap["sdi"] = "sr8"
+
+		isCDRom := make(map[string]bool)
+		for _, disk := range updatedVMI.Spec.Domain.Devices.Disks {
+			if disk.CDRom != nil {
+				isCDRom[disk.Name] = true
+			}
+		}
+
 		for _, volumeStatus := range updatedVMI.Status.VolumeStatus {
-			if _, ok := nameMap[volumeStatus.Name]; ok && volumeStatus.HotplugVolume != nil {
+			if _, ok := nameMap[volumeStatus.Name]; ok {
 				Expect(volumeStatus.Target).ToNot(BeEmpty())
-				res = append(res, fmt.Sprintf("/dev/%s", volumeStatus.Target))
+
+				if _, ok := isCDRom[volumeStatus.Name]; ok {
+					convertedTarget, ok := converterMap[volumeStatus.Target]
+					Expect(ok).To(BeTrue())
+					res = append(res, fmt.Sprintf("/dev/%s", convertedTarget))
+				} else if volumeStatus.HotplugVolume != nil {
+					res = append(res, fmt.Sprintf("/dev/%s", volumeStatus.Target))
+				}
 			}
 		}
 		return res
@@ -499,11 +547,15 @@ var _ = SIGDescribe("Hotplug", func() {
 		return vm
 	}
 
-	verifyHotplugAttachedAndUseable := func(vmi *v1.VirtualMachineInstance, names []string) []string {
+	verifyHotplugAttachedAndUseable := func(vmi *v1.VirtualMachineInstance, names []string, isCDROM bool) []string {
 		targets := getTargetsFromVolumeStatus(vmi, names...)
 		for _, target := range targets {
 			verifyVolumeAccessible(vmi, target)
-			verifyCreateData(vmi, target)
+			if isCDROM {
+				verifyCDROMAttached(vmi, target)
+			} else {
+				verifyCreateData(vmi, target)
+			}
 		}
 		return targets
 	}
@@ -560,6 +612,7 @@ var _ = SIGDescribe("Hotplug", func() {
 	}
 
 	verifyAttachDetachVolume := func(vm *v1.VirtualMachine, addVolumeFunc addVolumeFunction, removeVolumeFunc removeVolumeFunction, sc string, volumeMode corev1.PersistentVolumeMode, vmiOnly, waitToStart bool, isCDROM bool) {
+
 		dv := createDataVolumeAndWaitForImport(sc, volumeMode)
 
 		vmi, err := virtClient.VirtualMachineInstance(vm.Namespace).Get(context.Background(), vm.Name, &metav1.GetOptions{})
@@ -578,7 +631,7 @@ var _ = SIGDescribe("Hotplug", func() {
 		verifyVolumeAndDiskVMIAdded(virtClient, vmi, isCDROM, "testvolume")
 		verifyVolumeStatus(vmi, v1.VolumeReady, "", "testvolume")
 		getVmiConsoleAndLogin(vmi)
-		targets := verifyHotplugAttachedAndUseable(vmi, []string{"testvolume"})
+		targets := verifyHotplugAttachedAndUseable(vmi, []string{"testvolume"}, isCDROM)
 		verifySingleAttachmentPod(vmi)
 
 		By(removingVolumeFromVM)
@@ -587,7 +640,11 @@ var _ = SIGDescribe("Hotplug", func() {
 			By(verifyingVolumeNotExist)
 			verifyVolumeAndDiskVMRemoved(vm, isCDROM, "testvolume")
 		}
-		verifyVolumeNolongerAccessible(vmi, targets[0])
+		if isCDROM {
+			verifyCDROMNotAttached(vmi, targets[0])
+		} else {
+			verifyVolumeNolongerAccessible(vmi, targets[0])
+		}
 	}
 
 	verifyDetachAttachVolume := func(vm *v1.VirtualMachine, addVolumeFunc addVolumeFunction, removeVolumeFunc removeVolumeFunction, sc string, volumeMode corev1.PersistentVolumeMode, vmiOnly, waitToStart bool, isCDROM bool) {
@@ -600,34 +657,38 @@ var _ = SIGDescribe("Hotplug", func() {
 		By("verifying the vmi previously had the volume attached")
 		vmi, err = virtClient.VirtualMachineInstance(vm.Namespace).Get(context.Background(), vm.Name, &metav1.GetOptions{})
 		Expect(err).ToNot(HaveOccurred())
-		verifyVolumeAndDiskVMIAdded(virtClient, vmi, isCDROM, "testvolumeinserted")
-		verifyVolumeStatus(vmi, v1.VolumeReady, "", "testvolumeinserted")
+		verifyVolumeAndDiskVMIAdded(virtClient, vmi, isCDROM, "testvolume-insertedstart")
+		verifyVolumeStatus(vmi, v1.VolumeReady, "", "testvolume-insertedstart")
 		getVmiConsoleAndLogin(vmi)
-		targets := verifyHotplugAttachedAndUseable(vmi, []string{"testvolumeinserted"})
+		targets := verifyHotplugAttachedAndUseable(vmi, []string{"testvolume-insertedstart"}, isCDROM)
 		verifySingleAttachmentPod(vmi)
 
 		By(removingVolumeFromVM)
-		removeVolumeFunc(vm.Name, vm.Namespace, "testvolumeinserted", false)
+		removeVolumeFunc(vm.Name, vm.Namespace, "testvolume-insertedstart", false)
 		if !vmiOnly {
 			By(verifyingVolumeNotExist)
-			verifyVolumeAndDiskVMRemoved(vm, isCDROM, "testvolumeinserted")
+			verifyVolumeAndDiskVMRemoved(vm, isCDROM, "testvolume-insertedstart")
 		}
-		verifyVolumeNolongerAccessible(vmi, targets[0])
+		if isCDROM {
+			verifyCDROMNotAttached(vmi, targets[0])
+		} else {
+			verifyVolumeNolongerAccessible(vmi, targets[0])
+		}
 
 		dv := createDataVolumeAndWaitForImport(sc, volumeMode)
 
 		By(addingVolumeRunningVM)
-		addVolumeFunc(vm.Name, vm.Namespace, "testvolumeinserted", dv.Name, v1.DiskBusSCSI, false, "")
+		addVolumeFunc(vm.Name, vm.Namespace, "testvolume-insertedstart", dv.Name, v1.DiskBusSCSI, false, "")
 		By(verifyingVolumeDiskInVM)
 		if !vmiOnly {
-			verifyVolumeAndDiskVMAdded(virtClient, vm, isCDROM, "testvolumeinserted")
+			verifyVolumeAndDiskVMAdded(virtClient, vm, isCDROM, "testvolume-insertedstart")
 		}
 		vmi, err = virtClient.VirtualMachineInstance(vm.Namespace).Get(context.Background(), vm.Name, &metav1.GetOptions{})
 		Expect(err).ToNot(HaveOccurred())
-		verifyVolumeAndDiskVMIAdded(virtClient, vmi, isCDROM, "testvolumeinserted")
-		verifyVolumeStatus(vmi, v1.VolumeReady, "", "testvolumeinserted")
+		verifyVolumeAndDiskVMIAdded(virtClient, vmi, isCDROM, "testvolume-insertedstart")
+		verifyVolumeStatus(vmi, v1.VolumeReady, "", "testvolume-insertedstart")
 		getVmiConsoleAndLogin(vmi)
-		_ = verifyHotplugAttachedAndUseable(vmi, []string{"testvolumeinserted"})
+		_ = verifyHotplugAttachedAndUseable(vmi, []string{"testvolume-insertedstart"}, isCDROM)
 		verifySingleAttachmentPod(vmi)
 	}
 
@@ -663,8 +724,8 @@ var _ = SIGDescribe("Hotplug", func() {
 					Name: insertedVolName,
 					DiskDevice: v1.DiskDevice{
 						CDRom: &v1.CDRomTarget{
-							Tray: "closed",
-							Bus:  "sata",
+							Bus:      v1.DiskBusSATA,
+							ReadOnly: pointer.Bool(true),
 						},
 					},
 				},
@@ -686,8 +747,8 @@ var _ = SIGDescribe("Hotplug", func() {
 					Name: ejectedVolName,
 					DiskDevice: v1.DiskDevice{
 						CDRom: &v1.CDRomTarget{
-							Tray: "closed",
-							Bus:  "sata",
+							Bus:      v1.DiskBusSATA,
+							ReadOnly: pointer.Bool(true),
 						},
 					},
 				},
@@ -813,7 +874,7 @@ var _ = SIGDescribe("Hotplug", func() {
 			verifyVolumeAndDiskVMIAdded(virtClient, vmi, false, dvNames...)
 			verifyVolumeStatus(vmi, v1.VolumeReady, "", dvNames...)
 			getVmiConsoleAndLogin(vmi)
-			verifyHotplugAttachedAndUseable(vmi, dvNames)
+			verifyHotplugAttachedAndUseable(vmi, dvNames, false)
 			verifySingleAttachmentPod(vmi)
 			for _, volumeName := range dvNames {
 				By("removing volume " + volumeName + " from VM")
@@ -909,7 +970,7 @@ var _ = SIGDescribe("Hotplug", func() {
 				Expect(err).ToNot(HaveOccurred())
 				verifyVolumeAndDiskVMIAdded(virtClient, vmi, false, testVolumes...)
 				verifyVolumeStatus(vmi, v1.VolumeReady, "", testVolumes...)
-				targets := verifyHotplugAttachedAndUseable(vmi, testVolumes)
+				targets := verifyHotplugAttachedAndUseable(vmi, testVolumes, false)
 				verifySingleAttachmentPod(vmi)
 				for _, volumeName := range testVolumes {
 					By("removing volume " + volumeName + " from VM")
@@ -1033,7 +1094,7 @@ var _ = SIGDescribe("Hotplug", func() {
 
 				By("Verifying the volume is attached and usable")
 				getVmiConsoleAndLogin(vmi)
-				targets := verifyHotplugAttachedAndUseable(vmi, []string{"testvolume"})
+				targets := verifyHotplugAttachedAndUseable(vmi, []string{"testvolume"}, false)
 				Expect(targets).To(HaveLen(1))
 
 				By("stopping VM")
@@ -1186,7 +1247,7 @@ var _ = SIGDescribe("Hotplug", func() {
 				addEjectedAndInsertedVolumesAndDisksOnSpec(vm, "", "testvolume", "", "")
 
 				dv := createDataVolumeAndWaitForImport(sc, corev1.PersistentVolumeFilesystem)
-				addEjectedAndInsertedVolumesAndDisksOnSpec(vm, "testvolumeinserted", "", "DV", dv.Name)
+				addEjectedAndInsertedVolumesAndDisksOnSpec(vm, "testvolume-insertedstart", "", "DV", dv.Name)
 
 				vm, err = virtClient.VirtualMachine(testsuite.GetTestNamespace(vmi)).Create(context.Background(), vm)
 				Expect(err).ToNot(HaveOccurred())
@@ -1194,7 +1255,7 @@ var _ = SIGDescribe("Hotplug", func() {
 					vm, err := virtClient.VirtualMachine(testsuite.GetTestNamespace(vmi)).Get(context.Background(), vm.Name, &metav1.GetOptions{})
 					Expect(err).ToNot(HaveOccurred())
 					return vm.Status.Ready
-				}, 9000*time.Second, 1*time.Second).Should(BeTrue())
+				}, 240*time.Second, 1*time.Second).Should(BeTrue())
 			})
 
 			FDescribeTable("should insert / eject cdrom", func(addVolumeFunc addVolumeFunction, removeVolumeFunc removeVolumeFunction, vmiOnly, waitToStart bool) {
@@ -1217,26 +1278,18 @@ var _ = SIGDescribe("Hotplug", func() {
 				Entry("with PersistentVolume wait for VM to finish starting", insertCDROMPVCVolumeVM, removeVolumeVM, false, true),
 			)
 
-			FIt("should permanently add hotplug cdrom when added to VM, but still ejecatble after restart", func() {
-				dvBlock := createDataVolumeAndWaitForImport(sc, corev1.PersistentVolumeBlock)
-
+			FIt("cdrom added to vm should till be ejectable after restart", func() {
+				By(verifyingVolumeDiskInVM)
+				verifyVolumeAndDiskVMAdded(virtClient, vm, true, "testvolume-insertedstart")
 				vmi, err := virtClient.VirtualMachineInstance(vm.Namespace).Get(context.Background(), vm.Name, &metav1.GetOptions{})
 				Expect(err).ToNot(HaveOccurred())
-				libwait.WaitForSuccessfulVMIStartWithTimeout(vmi, 240)
-
-				By(addingVolumeRunningVM)
-				insertCDROMDVVolumeVM(vm.Name, vm.Namespace, "testvolume", dvBlock.Name, v1.DiskBusSCSI, false, "")
-				By(verifyingVolumeDiskInVM)
-				verifyVolumeAndDiskVMAdded(virtClient, vm, true, "testvolume")
-				vmi, err = virtClient.VirtualMachineInstance(vm.Namespace).Get(context.Background(), vm.Name, &metav1.GetOptions{})
-				Expect(err).ToNot(HaveOccurred())
-				verifyVolumeAndDiskVMIAdded(virtClient, vmi, true, "testvolume")
-				verifyVolumeStatus(vmi, v1.VolumeReady, "", "testvolume")
+				verifyVolumeAndDiskVMIAdded(virtClient, vmi, true, "testvolume-insertedstart")
+				verifyVolumeStatus(vmi, v1.VolumeReady, "", "testvolume-insertedstart")
 				verifySingleAttachmentPod(vmi)
 
 				By("Verifying the volume is attached and usable")
 				getVmiConsoleAndLogin(vmi)
-				targets := verifyHotplugAttachedAndUseable(vmi, []string{"testvolume"})
+				targets := verifyHotplugAttachedAndUseable(vmi, []string{"testvolume-insertedstart"}, true)
 				Expect(targets).To(HaveLen(1))
 
 				By("stopping VM")
@@ -1248,20 +1301,21 @@ var _ = SIGDescribe("Hotplug", func() {
 				Expect(err).ToNot(HaveOccurred())
 
 				By("Verifying that the hotplugged volume is hotpluggable after a restart")
-				verifyVolumeAndDiskVMIAdded(virtClient, vmi, true, "testvolume")
-				verifyVolumeStatus(vmi, v1.VolumeReady, "", "testvolume")
+				verifyVolumeAndDiskVMIAdded(virtClient, vmi, true, "testvolume-insertedstart")
+				verifyVolumeStatus(vmi, v1.VolumeReady, "", "testvolume-insertedstart")
 
 				By("Verifying the hotplug device is auto-mounted during booting")
 				getVmiConsoleAndLogin(vmi)
 				verifyVolumeAccessible(vmi, targets[0])
 
 				By("Remove volume from a running VM")
-				removeVolumeVM(vm.Name, vm.Namespace, "testvolume", false)
+				removeVolumeVM(vm.Name, vm.Namespace, "testvolume-insertedstart", false)
 				vmi, err = virtClient.VirtualMachineInstance(vm.Namespace).Get(context.Background(), vm.Name, &metav1.GetOptions{})
 				Expect(err).ToNot(HaveOccurred())
 
 				By("Verifying that the hotplugged volume can be unplugged after a restart")
-				verifyVolumeNolongerAccessible(vmi, targets[0])
+				verifyVolumeAndDiskVMRemoved(vm, true, "testvolume-insertedstart")
+				verifyCDROMNotAttached(vmi, targets[0])
 			})
 		})
 
@@ -1339,7 +1393,7 @@ var _ = SIGDescribe("Hotplug", func() {
 				Expect(err).ToNot(HaveOccurred())
 				verifyVolumeAndDiskVMIAdded(virtClient, vmi, true, testVolumes...)
 				verifyVolumeStatus(vmi, v1.VolumeReady, "", testVolumes...)
-				targets := verifyHotplugAttachedAndUseable(vmi, testVolumes)
+				targets := verifyHotplugAttachedAndUseable(vmi, testVolumes, true)
 				verifySingleAttachmentPod(vmi)
 				for _, volumeName := range testVolumes {
 					By("removing volume " + volumeName + " from VM")
@@ -1350,7 +1404,7 @@ var _ = SIGDescribe("Hotplug", func() {
 					}
 				}
 				for i := range testVolumes {
-					verifyVolumeNolongerAccessible(vmi, targets[i])
+					verifyCDROMNotAttached(vmi, targets[i])
 				}
 			},
 				Entry("with VMs", insertCDROMDVVolumeVM, removeVolumeVM, false),
@@ -1447,7 +1501,7 @@ var _ = SIGDescribe("Hotplug", func() {
 
 				By("Verifying the volume is attached and usable")
 				getVmiConsoleAndLogin(vmi)
-				targets := verifyHotplugAttachedAndUseable(vmi, []string{volumeName})
+				targets := verifyHotplugAttachedAndUseable(vmi, []string{volumeName}, false)
 				Expect(targets).To(HaveLen(1))
 
 				By("Starting the migration multiple times")
