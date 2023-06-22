@@ -2230,7 +2230,7 @@ type AddVolumeOptions struct {
 	// set inside the Disk struct itself.
 	Name string `json:"name"`
 	// Disk represents the hotplug disk that will be plugged into the running VMI
-	Disk *Disk `json:"disk"`
+	Disk *Disk `json:"disk,omitempty"`
 	// VolumeSource represents the source of the volume to map to the disk.
 	VolumeSource *HotplugVolumeSource `json:"volumeSource"`
 	// When present, indicates that modifications should not be

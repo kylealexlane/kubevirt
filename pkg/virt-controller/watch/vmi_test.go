@@ -2781,14 +2781,6 @@ var _ = Describe("VirtualMachineInstance watcher", func() {
 				},
 				[]string{},
 				nil),
-			Entry("should return an error if a new ejected cdrom volume is added but the previous volume did not have a target",
-				makeVolumeStatusesForUpdate(0),
-				makeEjectedCDRomVolumes(1, 0),
-				[]int{},
-				[]int{},
-				makeVolumeStatusesForUpdate(0),
-				[]string{},
-				asStrPtr("is ejected CDRom type, but there was no target for previously attached volume in volumeStatus")),
 		)
 
 		It("Should get default filesystem overhead if there are multiple CDI instances", func() {

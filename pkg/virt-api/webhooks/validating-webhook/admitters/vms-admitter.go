@@ -451,6 +451,7 @@ func (admitter *VMsAdmitter) validateVolumeRequests(vm *v1.VirtualMachine) ([]me
 	curVMRemoveRequestsMap := make(map[string]*v1.VirtualMachineVolumeRequest)
 
 	vmVolumeMap := make(map[string]v1.Volume)
+	vmDiskMap := make(map[string]v1.Disk)
 	vmiVolumeMap := make(map[string]v1.Volume)
 
 	vmi := &v1.VirtualMachineInstance{}
@@ -479,6 +480,10 @@ func (admitter *VMsAdmitter) validateVolumeRequests(vm *v1.VirtualMachine) ([]me
 		vmVolumeMap[volume.Name] = volume
 	}
 
+	for _, disk := range vm.Spec.Template.Spec.Domain.Devices.Disks {
+		vmDiskMap[disk.Name] = disk
+	}
+
 	newSpec := vm.Spec.Template.Spec.DeepCopy()
 	for _, volumeRequest := range vm.Status.VolumeRequests {
 		volumeRequest := volumeRequest
@@ -501,52 +506,20 @@ func (admitter *VMsAdmitter) validateVolumeRequests(vm *v1.VirtualMachine) ([]me
 				}}, nil
 			}
 
-			// Validate the disk is configured properly
-			if volumeRequest.AddVolumeOptions.Disk == nil {
-				return []metav1.StatusCause{{
-					Type:    metav1.CauseTypeFieldValueInvalid,
-					Message: fmt.Sprintf("AddVolume request for [%s] requires the disk field to be set.", name),
-					Field:   k8sfield.NewPath("Status", "volumeRequests").String(),
-				}}, nil
-			} else if volumeRequest.AddVolumeOptions.Disk.DiskDevice.Disk == nil {
-				return []metav1.StatusCause{{
-					Type:    metav1.CauseTypeFieldValueInvalid,
-					Message: fmt.Sprintf("AddVolume request for [%s] requires diskDevice of type 'disk' to be used.", name),
-					Field:   k8sfield.NewPath("Status", "volumeRequests").String(),
-				}}, nil
-			} else if volumeRequest.AddVolumeOptions.Disk.DiskDevice.Disk.Bus != "scsi" {
-				return []metav1.StatusCause{{
-					Type:    metav1.CauseTypeFieldValueInvalid,
-					Message: fmt.Sprintf("AddVolume request for [%s] requires disk bus to be 'scsi'. [%s] is not permitted", name, volumeRequest.AddVolumeOptions.Disk.DiskDevice.Disk.Bus),
-					Field:   k8sfield.NewPath("Status", "volumeRequests").String(),
-				}}, nil
-			}
-
-			newVolume := v1.Volume{
-				Name: volumeRequest.AddVolumeOptions.Name,
-			}
-			if volumeRequest.AddVolumeOptions.VolumeSource.PersistentVolumeClaim != nil {
-				newVolume.VolumeSource.PersistentVolumeClaim = volumeRequest.AddVolumeOptions.VolumeSource.PersistentVolumeClaim
-			} else if volumeRequest.AddVolumeOptions.VolumeSource.DataVolume != nil {
-				newVolume.VolumeSource.DataVolume = volumeRequest.AddVolumeOptions.VolumeSource.DataVolume
-			}
-
-			vmVolume, ok := vmVolumeMap[name]
-			if ok && !equality.Semantic.DeepEqual(newVolume, vmVolume) {
-				return []metav1.StatusCause{{
-					Type:    metav1.CauseTypeFieldValueInvalid,
-					Message: fmt.Sprintf("AddVolume request for [%s] conflicts with an existing volume of the same name on the vmi template.", name),
-					Field:   k8sfield.NewPath("Status", "volumeRequests").String(),
-				}}, nil
-			}
-
-			vmiVolume, ok := vmiVolumeMap[name]
-			if ok && !equality.Semantic.DeepEqual(newVolume, vmiVolume) {
-				return []metav1.StatusCause{{
-					Type:    metav1.CauseTypeFieldValueInvalid,
-					Message: fmt.Sprintf("AddVolume request for [%s] conflicts with an existing volume of the same name on currently running vmi", name),
-					Field:   k8sfield.NewPath("Status", "volumeRequests").String(),
-				}}, nil
+			if controller.IsInsertCDRomRequest(&volumeRequest) {
+				if statusCauses := validateDiskForInsertCDROM(&volumeRequest, name, vmDiskMap); statusCauses != nil {
+					return statusCauses, nil
+				}
+				if statusCauses := validateVolumeSourceForInsertCDROM(&volumeRequest, name, vmVolumeMap, vmiVolumeMap, vmiExists); statusCauses != nil {
+					return statusCauses, nil
+				}
+			} else {
+				if statusCauses := validateDisk(&volumeRequest, name); statusCauses != nil {
+					return statusCauses, nil
+				}
+				if statusCauses := validateVolumeSource(&volumeRequest, name, vmVolumeMap, vmiVolumeMap); statusCauses != nil {
+					return statusCauses, nil
+				}
 			}
 
 			curVMAddRequestsMap[name] = &volumeRequest
@@ -601,6 +574,115 @@ func (admitter *VMsAdmitter) validateVolumeRequests(vm *v1.VirtualMachine) ([]me
 
 	return nil, nil
 
+}
+
+func validateDisk(volumeRequest *v1.VirtualMachineVolumeRequest, name string) []metav1.StatusCause {
+	if volumeRequest.AddVolumeOptions.Disk == nil {
+		return []metav1.StatusCause{{
+			Type:    metav1.CauseTypeFieldValueInvalid,
+			Message: fmt.Sprintf("AddVolume request for [%s] requires the disk field to be set.", name),
+			Field:   k8sfield.NewPath("Status", "volumeRequests").String(),
+		}}
+	} else if volumeRequest.AddVolumeOptions.Disk.DiskDevice.Disk == nil {
+		return []metav1.StatusCause{{
+			Type:    metav1.CauseTypeFieldValueInvalid,
+			Message: fmt.Sprintf("AddVolume request for [%s] requires diskDevice of type 'disk' to be used.", name),
+			Field:   k8sfield.NewPath("Status", "volumeRequests").String(),
+		}}
+	} else if volumeRequest.AddVolumeOptions.Disk.DiskDevice.Disk.Bus != "scsi" {
+		return []metav1.StatusCause{{
+			Type:    metav1.CauseTypeFieldValueInvalid,
+			Message: fmt.Sprintf("AddVolume request for [%s] requires disk bus to be 'scsi'. [%s] is not permitted", name, volumeRequest.AddVolumeOptions.Disk.DiskDevice.Disk.Bus),
+			Field:   k8sfield.NewPath("Status", "volumeRequests").String(),
+		}}
+	}
+	return nil
+}
+
+func validateDiskForInsertCDROM(volumeRequest *v1.VirtualMachineVolumeRequest, name string, vmDiskMap map[string]v1.Disk) []metav1.StatusCause {
+	if volumeRequest.AddVolumeOptions.Disk != nil {
+		return []metav1.StatusCause{{
+			Type:    metav1.CauseTypeFieldValueInvalid,
+			Message: fmt.Sprintf("AddVolume request for [%s] is an insert cdrom request, and requires the disk field to not be set.", name),
+			Field:   k8sfield.NewPath("Status", "volumeRequests").String(),
+		}}
+	}
+	if disk, ok := vmDiskMap[volumeRequest.AddVolumeOptions.Name]; !ok || disk.CDRom == nil {
+		return []metav1.StatusCause{{
+			Type:    metav1.CauseTypeFieldValueInvalid,
+			Message: fmt.Sprintf("AddVolume request for [%s] is an insert cdrom request, and requires a currently ejected cdrom disk on the vm.", name),
+			Field:   k8sfield.NewPath("Status", "volumeRequests").String(),
+		}}
+	}
+	return nil
+}
+
+func validateVolumeSource(volumeRequest *v1.VirtualMachineVolumeRequest, name string, vmVolumeMap map[string]v1.Volume, vmiVolumeMap map[string]v1.Volume) []metav1.StatusCause {
+	newVolume := v1.Volume{
+		Name: volumeRequest.AddVolumeOptions.Name,
+	}
+	if volumeRequest.AddVolumeOptions.VolumeSource.PersistentVolumeClaim != nil {
+		newVolume.VolumeSource.PersistentVolumeClaim = volumeRequest.AddVolumeOptions.VolumeSource.PersistentVolumeClaim
+	} else if volumeRequest.AddVolumeOptions.VolumeSource.DataVolume != nil {
+		newVolume.VolumeSource.DataVolume = volumeRequest.AddVolumeOptions.VolumeSource.DataVolume
+	}
+
+	vmVolume, ok := vmVolumeMap[name]
+	if ok && !equality.Semantic.DeepEqual(newVolume, vmVolume) {
+		return []metav1.StatusCause{{
+			Type:    metav1.CauseTypeFieldValueInvalid,
+			Message: fmt.Sprintf("AddVolume request for [%s] conflicts with an existing volume of the same name on the vmi template.", name),
+			Field:   k8sfield.NewPath("Status", "volumeRequests").String(),
+		}}
+	}
+
+	vmiVolume, ok := vmiVolumeMap[name]
+	if ok && !equality.Semantic.DeepEqual(newVolume, vmiVolume) {
+		return []metav1.StatusCause{{
+			Type:    metav1.CauseTypeFieldValueInvalid,
+			Message: fmt.Sprintf("AddVolume request for [%s] conflicts with an existing volume of the same name on currently running vmi", name),
+			Field:   k8sfield.NewPath("Status", "volumeRequests").String(),
+		}}
+	}
+
+	return nil
+}
+
+func validateVolumeSourceForInsertCDROM(volumeRequest *v1.VirtualMachineVolumeRequest, name string, vmVolumeMap map[string]v1.Volume, vmiVolumeMap map[string]v1.Volume, vmiExists bool) []metav1.StatusCause {
+	// There are two valid states for the volume:
+	// 1. The volume is currently ejected, which means the request still needs to
+	// be processed on the controller.
+	// 2. The volume matches the new volume, which means the request was processed
+	// but still needs to be cleaned up by the controller.
+
+	newVolume := v1.Volume{
+		Name: volumeRequest.AddVolumeOptions.Name,
+	}
+	if volumeRequest.AddVolumeOptions.VolumeSource.PersistentVolumeClaim != nil {
+		newVolume.VolumeSource.PersistentVolumeClaim = volumeRequest.AddVolumeOptions.VolumeSource.PersistentVolumeClaim
+	} else if volumeRequest.AddVolumeOptions.VolumeSource.DataVolume != nil {
+		newVolume.VolumeSource.DataVolume = volumeRequest.AddVolumeOptions.VolumeSource.DataVolume
+	}
+
+	vmVolume, ok := vmVolumeMap[name]
+	if !ok || (vmVolume.EjectedCDRom == nil && !equality.Semantic.DeepEqual(newVolume, vmVolume)) {
+		return []metav1.StatusCause{{
+			Type:    metav1.CauseTypeFieldValueInvalid,
+			Message: fmt.Sprintf("AddVolume request for [%s] is an insert cdrom request, and requires the matching volume on the vmi template to be an ejected cdrom or match the new inserted volume.", name),
+			Field:   k8sfield.NewPath("Status", "volumeRequests").String(),
+		}}
+	}
+
+	vmiVolume, ok := vmiVolumeMap[name]
+	if vmiExists && (!ok || (vmiVolume.EjectedCDRom == nil && !equality.Semantic.DeepEqual(newVolume, vmiVolume))) {
+		return []metav1.StatusCause{{
+			Type:    metav1.CauseTypeFieldValueInvalid,
+			Message: fmt.Sprintf("AddVolume request for [%s] is an insert cdrom request, and requires the matching volume on the currently running vmi to be an ejected cdrom or match the new inserted volume.", name),
+			Field:   k8sfield.NewPath("Status", "volumeRequests").String(),
+		}}
+	}
+
+	return nil
 }
 
 func validateRestoreStatus(ar *admissionv1.AdmissionRequest, vm *v1.VirtualMachine) []metav1.StatusCause {

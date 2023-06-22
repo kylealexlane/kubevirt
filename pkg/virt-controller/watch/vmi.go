@@ -730,7 +730,14 @@ func (c *VMIController) updateStatus(vmi *virtv1.VirtualMachineInstance, pod *k8
 
 	case vmi.IsScheduled():
 		// Nothing here
-		break
+		if !vmiPodExists {
+			break
+		}
+
+		if err := c.updateVolumeStatus(vmiCopy, pod); err != nil {
+			return err
+		}
+
 	default:
 		return fmt.Errorf("unknown vmi phase %v", vmi.Status.Phase)
 	}
@@ -2105,6 +2112,9 @@ func (c *VMIController) deleteOrphanedAttachmentPods(vmi *virtv1.VirtualMachineI
 }
 
 func (c *VMIController) updateVolumeStatus(vmi *virtv1.VirtualMachineInstance, virtlauncherPod *k8sv1.Pod) error {
+	log.Log.V(1).Infof("Updating Volume Status'")
+	log.Log.V(1).Infof("virtlauncherPod is %+v", virtlauncherPod)
+
 	oldStatus := vmi.Status.DeepCopy().VolumeStatus
 	oldStatusMap := make(map[string]virtv1.VolumeStatus)
 	for _, status := range oldStatus {
@@ -2126,8 +2136,10 @@ func (c *VMIController) updateVolumeStatus(vmi *virtv1.VirtualMachineInstance, v
 		status := virtv1.VolumeStatus{}
 		if _, ok := oldStatusMap[volume.Name]; ok {
 			// Already have the status, modify if needed
+			log.Log.V(1).Infof("Modifying status.. old is: %+v", oldStatusMap[volume.Name])
 			status = oldStatusMap[volume.Name]
 		} else {
+			log.Log.V(1).Infof("not using old status for %v", volume.Name)
 			status.Name = volume.Name
 		}
 
@@ -2142,6 +2154,8 @@ func (c *VMIController) updateVolumeStatus(vmi *virtv1.VirtualMachineInstance, v
 				}
 			}
 			attachmentPod := c.findAttachmentPodByVolumeName(volume.Name, attachmentPods)
+			log.Log.V(1).Infof("attachmentPod for volume: %v is: %+v", volume.Name, attachmentPod)
+
 			if attachmentPod == nil {
 				status.HotplugVolume.AttachPodName = ""
 				status.HotplugVolume.AttachPodUID = ""
@@ -2190,12 +2204,6 @@ func (c *VMIController) updateVolumeStatus(vmi *virtv1.VirtualMachineInstance, v
 		if volume.EjectedCDRom != nil {
 			status = virtv1.VolumeStatus{}
 			if oldStatus, ok := oldStatusMap[volume.Name]; ok {
-				if oldStatus.Target == "" {
-					err := fmt.Errorf("volume %s is ejected CDRom type, but there was no target for previously attached volume in volumeStatus", volume.Name)
-					log.Log.Reason(err)
-					return err
-				}
-
 				status.Name = oldStatus.Name
 				status.Target = oldStatus.Target
 				status.Phase = oldStatus.Phase
@@ -2265,7 +2273,7 @@ func (c *VMIController) getFilesystemOverhead(pvc *k8sv1.PersistentVolumeClaim) 
 
 func (c *VMIController) canMoveToAttachedPhase(currentPhase virtv1.VolumePhase) bool {
 	return currentPhase == "" || currentPhase == virtv1.VolumeBound || currentPhase == virtv1.VolumePending ||
-		currentPhase == virtv1.HotplugVolumeAttachedToNode
+		currentPhase == virtv1.HotplugVolumeAttachedToNode || currentPhase == virtv1.EjectedCDRom || currentPhase == virtv1.EjectingCDRom
 }
 
 func (c *VMIController) findAttachmentPodByVolumeName(volumeName string, attachmentPods []*k8sv1.Pod) *k8sv1.Pod {

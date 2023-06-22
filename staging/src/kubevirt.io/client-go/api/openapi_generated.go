@@ -15576,7 +15576,7 @@ func schema_kubevirtio_api_core_v1_AddVolumeOptions(ref common.ReferenceCallback
 						},
 					},
 				},
-				Required: []string{"name", "disk", "volumeSource"},
+				Required: []string{"name", "volumeSource"},
 			},
 		},
 		Dependencies: []string{
